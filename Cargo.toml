@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/flock-core", "crates/flock-prover"]
+members = ["crates/flock-core", "crates/flock-prover", "crates/pq-tornado"]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,21 @@
+[package]
+name = "pq-tornado"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A post-quantum Tornado Cash variant built on the Flock proving system"
+
+[dependencies]
+flock-prover = { path = "../flock-prover" }
+sha2 = { workspace = true, features = ["compress"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+rayon = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "pq_tornado"
+path = "src/bin/pq_tornado.rs"
