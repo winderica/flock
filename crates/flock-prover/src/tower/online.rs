@@ -1,10 +1,10 @@
-use {bincode::serialize, serde::Serialize};
-
+use bincode::serialize;
 #[cfg(test)]
 use flock_core::{
     pcs::{MergedOpenProof, ligerito::RecursiveProof},
     proof::R1csProofCircuitMerged,
 };
+use serde::Serialize;
 
 #[allow(unused_imports)] // used only under cfg(test)
 use crate::tower::{MixedProof, PcsParams};
@@ -28,25 +28,25 @@ use crate::tower::{MixedProof, PcsParams};
 // the union and PCS params, the fill plan, the tape pins. A shape is
 // statement-independent (the digest pins say so), so a production prover
 // pays it once per level and then never again.
-// Populated by the pub builders; READ only by the in-file `#[test]` benches
-// (`tower_online_bench` and friends), so the lib unit sees the fields unread.
-#[cfg_attr(not(test), allow(dead_code))]
+// Populated by the pub builders; READ by the in-file `#[test]` benches
+// (`tower_online_bench` and friends) and by a workload's own leaf
+// builder, living in a crate outside this one, which is why every field
+// is `pub` — the lib unit itself only writes them.
 #[derive(Clone, Copy, Default)]
-pub(super) struct Online {
-    pub(super) setup_ms: f64,
-    pub(super) walk_ms: f64,
-    pub(super) tapes_ms: f64,
-    pub(super) witgen_ms: f64,
-    pub(super) prove_ms: f64,
-    pub(super) verify_ms: f64,
+pub struct Online {
+    pub setup_ms: f64,
+    pub walk_ms: f64,
+    pub tapes_ms: f64,
+    pub witgen_ms: f64,
+    pub prove_ms: f64,
+    pub verify_ms: f64,
     /// ONE timer around the whole online span (walk through prove), not the
     /// phase sum: everything between the phases — the union/PCS param
     /// construction, buffer drops, allocator work — lands here and nowhere
     /// else. `0.0` where a stage has not been wired for it.
-    pub(super) wall_ms: f64,
+    pub wall_ms: f64,
 }
 
-#[cfg(test)]
 impl Online {
     /// The per-proof online total. The MEASURED wall where a stage supplies
     /// it, the phase sum otherwise — a sum can only be a lower bound.
@@ -90,7 +90,7 @@ pub(super) fn median_total(runs: &[Online]) -> f64 {
 /// parent replays the child's transcript through its b3 slot at one
 /// compression per 64 bytes, so at the measured ~6.1 µs per b3 row a KiB of
 /// child proof is ~0.1 ms of parent per child.
-pub(super) fn census_kib<T: Serialize + ?Sized>(v: &T) -> f64 {
+pub fn census_kib<T: Serialize + ?Sized>(v: &T) -> f64 {
     serialize(v).expect("proof component serializes").len() as f64 / 1024.0
 }
 

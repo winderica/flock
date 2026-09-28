@@ -24,22 +24,40 @@ use flock_core::{
     pcs::jagged::JaggedParams,
 };
 
-use crate::proof_io::TowerRootBundle;
-use crate::tower::{
-    F128,
-    chain::{ChainProof, build_chain_proof},
-    config::TowerConfig,
-    fl_node::{FlNode, build_first_level_node, chain_blake_r1cs, chain_jagged_params},
-    gates_blake3::pack4,
-    node::{
-        ChainLane, NodeOut, SpineIn, build_node_outer_app, digest_f128, entry_live,
-        node_jagged_params,
+use crate::{
+    proof_io::TowerRootBundle,
+    tower::{
+        F128, TowerLeaf,
+        chain::{build_chain_proof, native_chain},
+        config::TowerConfig,
+        fl_node::{FlNode, build_first_level_node_kids, combine_digests, inner_jagged_params},
+        gates_blake3::{pack4, unpack4},
+        node::{
+            AppKind, ChainLane, NodeOut, SpineIn, build_node_outer_app_kind, digest_f128,
+            entry_live, node_jagged_params,
+        },
+        online::census_kib,
+        query::leaf_boolean_mats,
+        span_count_word,
+        verify::RootBundle,
     },
-    online::census_kib,
-    query::leaf_boolean_mats,
-    span_count_word,
-    verify::RootBundle,
 };
+
+/// A tower's application statement, KIND-ERASED: the composed app block's
+/// 8 packed F128 words — exactly what the root publishes, in the same
+/// layout its [`AppKind`] produces — plus the span-counter count.
+/// [`ChainStatement`] (here) and a digest workload's own statement type,
+/// defined in that workload's own crate, are workload-specific VIEWS onto
+/// the same 8 words; `to_app`/`from_app` convert between a view and this
+/// wire form. [`Tower::discharge_root`]
+/// and [`crate::tower::verify::verify_root`] compare `words` against the
+/// root's own published app block word for word — no workload match, so a
+/// third workload's leaf needs no change here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppStatement {
+    pub words: [F128; 8],
+    pub count: usize,
+}
 
 /// What a tower run attests: `h_end == H^{n_blocks}(h_start)` over the
 /// BLAKE3 compression chain — endpoints AND count. The count rides the
@@ -52,6 +70,65 @@ pub struct ChainStatement {
     pub h_end: [u32; 16],
     /// TOTAL compressions across the span: `n_leaves * blocks_per_leaf`.
     pub n_blocks: usize,
+}
+
+impl ChainStatement {
+    /// This statement's app words, packed exactly as the root's chain FL
+    /// publishes them: `[h_start x4 | h_end x4]`.
+    pub fn to_app(&self) -> AppStatement {
+        let word =
+            |h: &[u32; 16], j: usize| pack4(h[4 * j..4 * j + 4].try_into().expect("4 words"));
+        let mut words = [F128::ZERO; 8];
+        for j in 0..4 {
+            words[j] = word(&self.h_start, j);
+            words[4 + j] = word(&self.h_end, j);
+        }
+        AppStatement {
+            words,
+            count: self.n_blocks,
+        }
+    }
+    /// The inverse of [`Self::to_app`].
+    pub fn from_app(a: &AppStatement) -> Self {
+        let decode = |base: usize| -> [u32; 16] {
+            let mut out = [0u32; 16];
+            for j in 0..4 {
+                out[4 * j..4 * j + 4].copy_from_slice(&unpack4(a.words[base + j]));
+            }
+            out
+        };
+        ChainStatement {
+            h_start: decode(0),
+            h_end: decode(4),
+            n_blocks: a.count,
+        }
+    }
+}
+
+/// The digest tree in the TOWER'S FOLD ORDER, natively: leaves pair into
+/// FLs left to right; the BASE folds the last two FLs; every level above
+/// prepends the next-earlier FL. So the root is
+/// `C(fl_0, C(fl_1, … C(fl_{k-2}, fl_{k-1})))` with `fl_i = C(l_{2i}, l_{2i+1})`.
+/// Generic over any [`AppKind::Digest`] workload's per-leaf digests — a
+/// digest workload built as a separate crate outside this one uses this
+/// to compute its own tower's expected root digest natively.
+pub fn native_digest_tree(leaf_digests: &[[u32; 8]]) -> [u32; 8] {
+    assert!(
+        leaf_digests.len() >= 4 && leaf_digests.len().is_multiple_of(2),
+        "a rooted tower: an even number of leaves, at least four"
+    );
+    let fls: Vec<[u32; 8]> = leaf_digests
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[a, b]| combine_digests(a, b))
+        .collect();
+    let k = fls.len();
+    let mut cur = combine_digests(&fls[k - 2], &fls[k - 1]);
+    for i in (0..k - 2).rev() {
+        cur = combine_digests(&fls[i], &cur);
+    }
+    cur
 }
 
 /// Which root-side discharge refused — see [`Tower::discharge_root`].
@@ -86,12 +163,12 @@ pub enum RootDischargeFailure {
 /// passenger's.
 pub struct Tower {
     pub(super) cfg: TowerConfig,
-    pub(super) statement: ChainStatement,
+    pub(super) statement: AppStatement,
     /// The app block's offset in every outer's public segment.
     pub(super) app_base: usize,
-    /// Leaf 0 — the chain lane's material owner (one shape for every
-    /// leaf).
-    pub(super) chain: ChainProof,
+    /// Leaf 0 — the lane's material owner (one shape for every leaf),
+    /// type-erased: whichever workload's [`TowerLeaf`] impl this tower ran.
+    pub(super) chain: Box<dyn TowerLeaf>,
     /// FL 0 (the root's own fresh child) — the outer tables' owner (one
     /// shape for every FL).
     pub(super) fl: FlNode,
@@ -105,8 +182,41 @@ pub struct Tower {
     /// transition made; a shallower root owes none.
     pub(super) expect_passenger: bool,
     /// The leaf size this tower ran at — the wire bundle's VK-selection
-    /// tag.
+    /// tag. Compressions per leaf for a chain, or whatever unit a
+    /// workload's own leaf counts.
     pub(super) blocks_per_leaf: usize,
+    /// A second VK-selection tag a workload's own leaf may need (e.g. a
+    /// Merkle-tree depth); `None` for a chain.
+    pub(super) depth: Option<usize>,
+    /// The run's cost ledger.
+    pub(super) costs: TowerCosts,
+}
+
+/// Where a tower run's wall clock went: the per-stage ONLINE spans (the
+/// per-statement work a deployment re-pays per proof) against the per-shape
+/// SETUP (circuit emission + fill-plan compilation — statement-independent,
+/// cacheable across runs, paid once per distinct shape here because the
+/// driver does not yet cache FL/node shapes).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TowerCosts {
+    pub leaves: usize,
+    pub leaf_online_ms: f64,
+    pub leaf_setup_ms: f64,
+    pub fls: usize,
+    pub fl_online_ms: f64,
+    pub fl_setup_ms: f64,
+    pub nodes: usize,
+    pub node_online_ms: f64,
+    pub node_setup_ms: f64,
+}
+
+impl TowerCosts {
+    pub fn online_ms(&self) -> f64 {
+        self.leaf_online_ms + self.fl_online_ms + self.node_online_ms
+    }
+    pub fn setup_ms(&self) -> f64 {
+        self.leaf_setup_ms + self.fl_setup_ms + self.node_setup_ms
+    }
 }
 
 impl Tower {
@@ -127,50 +237,126 @@ impl Tower {
         blocks_per_leaf: usize,
         n_leaves: usize,
     ) -> Tower {
+        // h_end is a pure function of (h_start, total blocks) — no need to
+        // build a single leaf to know the statement up front.
+        let h_end = native_chain(&h_start, n_leaves * blocks_per_leaf);
+        let statement = ChainStatement {
+            h_start,
+            h_end,
+            n_blocks: n_leaves * blocks_per_leaf,
+        }
+        .to_app();
+        let mut h = h_start;
+        Self::prove_leaves(
+            cfg,
+            n_leaves,
+            statement,
+            blocks_per_leaf,
+            None,
+            TowerCosts::default(),
+            |_| {
+                // Each segment starts at the last one's h_end — leaves
+                // build sequentially, the walk IS the chain compute.
+                let cp0 = build_chain_proof(cfg, h, blocks_per_leaf);
+                let cp1 = build_chain_proof(cfg, cp0.h_end, blocks_per_leaf);
+                h = cp1.h_end;
+                (cp0, cp1)
+            },
+        )
+    }
+
+    /// **FOLD `n_leaves` LEAVES, TWO AT A TIME**: the shared tail
+    /// [`Tower::prove`] (the BLAKE3 chain) and a workload's own driver,
+    /// living in a separate crate entirely outside this one, both drive —
+    /// `next_pair(i)` builds the tower's i-th
+    /// (0-indexed) leaf pair of one concrete [`TowerLeaf`] type; this pairs
+    /// each into a first-level node (leaf 0 of the run survives as the
+    /// lane's material owner, type-erased into the `Tower`), then
+    /// [`Self::fold_first_level`] settles the base and the spine. `pub`:
+    /// the extension surface's driving entry point.
+    pub fn prove_leaves<L: TowerLeaf + 'static>(
+        cfg: TowerConfig,
+        n_leaves: usize,
+        statement: AppStatement,
+        per_leaf: usize,
+        depth: Option<usize>,
+        mut costs: TowerCosts,
+        mut next_pair: impl FnMut(usize) -> (L, L),
+    ) -> Tower {
         assert!(
             n_leaves >= 4 && n_leaves.is_multiple_of(2),
             "the tower pairs leaves into 2-ary FLs and roots at a node: \
              n_leaves must be even and >= 4, got {n_leaves}"
         );
-        // ---- LEAVES + FIRST LEVEL, interleaved: prove a segment pair
-        // (each segment starts at the last h_end), fold it into its FL,
-        // drop the pair ----
-        let mut chain: Option<ChainProof> = None;
+        let mut owner: Option<L> = None;
         let mut fls: Vec<FlNode> = Vec::with_capacity(n_leaves / 2);
-        let mut h = h_start;
-        for _ in 0..n_leaves / 2 {
-            let cp0 = build_chain_proof(cfg, h, blocks_per_leaf);
-            let cp1 = build_chain_proof(cfg, cp0.h_end, blocks_per_leaf);
-            h = cp1.h_end;
-            fls.push(build_first_level_node(cfg, &cp0, &cp1));
-            // Leaf 0 survives as the lane's chain-side material owner
-            // (one shape for every leaf); every other leaf drops here.
-            chain.get_or_insert(cp0);
+        for i in 0..n_leaves / 2 {
+            let (l0, l1) = next_pair(i);
+            for l in [&l0, &l1] {
+                costs.leaves += 1;
+                costs.leaf_online_ms += l.online().total();
+                costs.leaf_setup_ms += l.online().setup_ms;
+            }
+            let kids: [&dyn TowerLeaf; 2] = [&l0, &l1];
+            fls.push(build_first_level_node_kids(cfg, &kids));
+            // Leaf 0 survives as the lane's material owner (one shape for
+            // every leaf); every other leaf drops here.
+            owner.get_or_insert(l0);
         }
-        let statement = ChainStatement {
-            h_start,
-            h_end: h,
-            n_blocks: n_leaves * blocks_per_leaf,
+        Self::fold_first_level(
+            cfg,
+            fls,
+            Box::new(owner.expect("leaf 0")),
+            statement,
+            per_leaf,
+            depth,
+            costs,
+        )
+    }
+
+    /// The BASE and the SPINE over a built first level — shared by both
+    /// workloads; the leaf owner supplies the lane's tables and the app
+    /// composition rule.
+    pub(super) fn fold_first_level(
+        cfg: TowerConfig,
+        fls: Vec<FlNode>,
+        leaf: Box<dyn TowerLeaf>,
+        statement: AppStatement,
+        blocks_per_leaf: usize,
+        depth: Option<usize>,
+        mut costs: TowerCosts,
+    ) -> Tower {
+        let kind = leaf.app_kind();
+        for fl in &fls {
+            costs.fls += 1;
+            costs.fl_online_ms += fl.t.total();
+            costs.fl_setup_ms += fl.t.setup_ms;
+        }
+        let mut note_node = |n: &NodeOut| {
+            costs.nodes += 1;
+            costs.node_online_ms += n.online.total();
+            costs.node_setup_ms += n.online.setup_ms;
         };
         let app_base = fls[0].stmt_base;
         let claims_base = fls[0].fold_pub_base;
 
-        let chain = chain.expect("leaf 0");
-        let registry = &chain.inner.built.shape.registry;
-        let blake = chain_blake_r1cs(chain.inner.nu);
+        let inner = leaf.inner();
+        let registry = &inner.built.shape.registry;
+        let blake = leaf.r1cs();
         let blake_lc = blake.csc_lincheck_circuit();
         let chain_mats = [(&blake.a_0, &blake.b_0)];
         let chain_circs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
-        let chain_circuit = &chain.inner.built.shape.circuit;
-        let chain_jp = chain_jagged_params(&chain);
+        let chain_circuit = &inner.built.shape.circuit;
+        let chain_jp = inner_jagged_params(inner);
 
         // ---- THE BASE: fresh-only over the LAST two FLs (the spine
         // grows by prepending, so the base covers the chain's tail) ----
         let k = fls.len();
-        let base = build_node_outer_app(
+        let base = build_node_outer_app_kind(
             cfg,
             &[&fls[k - 2].lo, &fls[k - 1].lo],
             Some(app_base),
+            kind,
             Some(ChainLane {
                 registry,
                 mats: &chain_mats,
@@ -182,6 +368,7 @@ impl Tower {
             }),
             None,
         );
+        note_node(&base);
 
         // ---- THE SPINE: prepend the next-earlier FL, level by level ----
         let (base, root) = if k == 2 {
@@ -191,10 +378,11 @@ impl Tower {
             for i in (0..k - 2).rev() {
                 let prev = cur.as_ref().unwrap_or(&base);
                 let prev_lane = prev.lane_acc.clone().expect("the lane rides every level");
-                let n = build_node_outer_app(
+                let n = build_node_outer_app_kind(
                     cfg,
                     &[&fls[i].lo, &prev.lo],
                     Some(app_base),
+                    kind,
                     Some(ChainLane {
                         registry,
                         mats: &chain_mats,
@@ -219,6 +407,7 @@ impl Tower {
                         "the spine converged and must stay converged"
                     );
                 }
+                note_node(&n);
                 cur = Some(n); // the folded spine node drops here
             }
             (
@@ -232,21 +421,33 @@ impl Tower {
             cfg,
             statement,
             app_base,
-            chain,
+            chain: leaf,
             fl,
             base,
             root,
             expect_passenger: k >= 4,
             blocks_per_leaf,
+            depth,
+            costs,
         }
+    }
+
+    /// The run's cost ledger — online vs per-shape setup, per stage.
+    pub fn costs(&self) -> &TowerCosts {
+        &self.costs
     }
 
     pub fn config(&self) -> TowerConfig {
         self.cfg
     }
 
-    pub fn statement(&self) -> &ChainStatement {
+    pub fn statement(&self) -> &AppStatement {
         &self.statement
+    }
+
+    /// The composition rule this tower's nodes used.
+    pub fn app_kind(&self) -> AppKind {
+        self.chain.app_kind()
     }
 
     /// The root proof's serialized size in KiB — the recursable artifact.
@@ -304,6 +505,7 @@ impl Tower {
         TowerRootBundle {
             config: self.cfg,
             blocks_per_leaf: self.blocks_per_leaf as u64,
+            depth: self.depth.map_or(0, |d| d as u64),
             statement: self.statement,
             public: self.root.lo.public.clone(),
             commitment: self.root.lo.commitment.clone(),
@@ -324,19 +526,14 @@ impl Tower {
         lane: &Accumulator,
         main: &Accumulator,
         passenger: &[([F128; 2], MatrixClaim)],
-        statement: &ChainStatement,
+        statement: &AppStatement,
         expect_passenger: bool,
     ) -> Result<(), RootDischargeFailure> {
         use RootDischargeFailure::*;
-        // (1) the statement.
-        let words =
-            |h: &[u32; 16], j: usize| pack4(h[4 * j..4 * j + 4].try_into().expect("4 words"));
-        for j in 0..4 {
-            if public[self.app_base + j] != words(&statement.h_start, j)
-                || public[self.app_base + 4 + j] != words(&statement.h_end, j)
-            {
-                return Err(Statement);
-            }
+        // (1) the statement: the root's app block, word for word — no
+        // workload match needed, [`AppStatement`] is kind-erased.
+        if public[self.app_base..self.app_base + 8] != statement.words[..] {
+            return Err(Statement);
         }
         // THE SPAN COUNTER: app word 8 is g^{n_blocks}, composed
         // multiplicatively child-to-parent, and word 9 is the counter
@@ -344,15 +541,15 @@ impl Tower {
         // (each parent copy-constrains its children's base word; the
         // root's is also pinned natively by check_public). Together the
         // count is proof-bound at EVERY depth.
-        if public[self.app_base + 8] != span_count_word(statement.n_blocks as u128)
+        if public[self.app_base + 8] != span_count_word(statement.count as u128)
             || public[self.app_base + 9] != span_count_word(self.blocks_per_leaf as u128)
         {
             return Err(Statement);
         }
-        // (2) the chain lane vs the chain tables (leaf 0's shape).
-        let blake = chain_blake_r1cs(self.chain.inner.nu);
+        // (2) the lane vs the leaf tables (leaf 0's shape).
+        let blake = self.chain.r1cs();
         let chain_mats = [(&blake.a_0, &blake.b_0)];
-        let chain_circuit = &self.chain.inner.built.shape.circuit;
+        let chain_circuit = &self.chain.inner().built.shape.circuit;
         if !lane.discharge(&chain_mats) {
             return Err(ChainLaneBoolean);
         }
@@ -362,7 +559,7 @@ impl Tower {
         if !lane.discharge_sigma(&[chain_circuit]) {
             return Err(ChainLaneSigma);
         }
-        let chain_jp = chain_jagged_params(&self.chain);
+        let chain_jp = inner_jagged_params(self.chain.inner());
         if !lane.discharge_jagged(&[(chain_circuit.digest(), &chain_jp)]) {
             return Err(ChainLaneJagged);
         }

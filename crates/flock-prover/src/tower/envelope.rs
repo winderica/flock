@@ -135,7 +135,7 @@ fn span_generator_full_order() {
 /// clock. `usize::MAX` = unset (the `TOWER_STEADY` env knob applies).
 pub(super) static STEADY_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-pub(super) fn steady_reps() -> usize {
+pub fn steady_reps() -> usize {
     let ov = STEADY_OVERRIDE.load(Ordering::Relaxed);
     if ov != usize::MAX {
         return ov;

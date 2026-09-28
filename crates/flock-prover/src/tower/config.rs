@@ -14,7 +14,7 @@ use crate::{
 /// recursion-node row-width choice). `prover_config_for` rejects a
 /// mismatched batch, so every params site whose `m` is content-derived
 /// must go through this.
-pub(super) fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> usize {
+pub fn pcs_batch_for(union: &UnionInstance, profile: LigeritoProfile) -> usize {
     embedded_initial_k_or_default(union.dense_m(), profile)
 }
 

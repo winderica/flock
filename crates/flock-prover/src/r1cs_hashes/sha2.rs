@@ -55,6 +55,7 @@ use flock_core::{
     },
     proof::{R1csClaim, R1csProofMergedLigerito},
     r1cs::{BlockR1cs, SparseBinaryMatrix},
+    schedule::IoWord,
     union::{SlotWitnessDest, UnionInstance},
     verifier::{FlockVerifyError, verify_ligerito_union},
 };
@@ -251,6 +252,41 @@ pub fn out_carry_bit(w: usize, b: usize) -> usize {
 #[inline]
 pub fn h_out_bit(w: usize, b: usize) -> usize {
     H_OUT_BASE + w * WORD_BITS + b
+}
+
+// ---------------------------------------------------------------------------
+// Wiring IO schema
+// ---------------------------------------------------------------------------
+
+/// Cell-slot indices into [`io_schema`] — the schema's order IS the
+/// enumeration order, so these are the `ι` a circuit wires against.
+pub const IO_H_IN0: usize = 0;
+pub const IO_M0: usize = 2;
+pub const IO_H_OUT0: usize = 6;
+
+/// The wireable words of one SHA-256 compression, in 128-bit words of the row.
+///
+/// **Everything a caller supplies must be here.** `H_in` and `M` are free
+/// witness — the relation does not pin them — so a word left out of the schema
+/// could be chosen by the prover. Both are exposed as inputs: a circuit that
+/// wants the fixed-IV hash wires `H_in` to a public cell carrying the IV,
+/// exactly as the chain wires its own chaining value.
+///
+/// The layout is already I/O-aligned (`H_in` at slot 0, `H_out` at slot 1,
+/// `M` at slots 2-3), so every schema entry is a whole committed word and no
+/// region straddles a word boundary.
+pub fn io_schema() -> Vec<IoWord> {
+    let w = |bit_base: usize| bit_base / 128;
+    vec![
+        IoWord::input(w(H_BASE)),          // h_in[0..4]
+        IoWord::input(w(H_BASE) + 1),      // h_in[4..8]
+        IoWord::input(w(M_BASE)),          // m[0..4]
+        IoWord::input(w(M_BASE) + 1),      // m[4..8]
+        IoWord::input(w(M_BASE) + 2),      // m[8..12]
+        IoWord::input(w(M_BASE) + 3),      // m[12..16]
+        IoWord::output(w(H_OUT_BASE)),     // h_out[0..4]
+        IoWord::output(w(H_OUT_BASE) + 1), // h_out[4..8]
+    ]
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1572,7 +1608,9 @@ fn batch_major_const_add(
     sum
 }
 
-fn build_group_batch_major(
+/// `pub`: a workload's own fused SHA-256 table, built as a separate crate
+/// outside this one, reuses this per-group builder verbatim.
+pub fn build_group_batch_major(
     inputs: [&([u32; 8], [u32; 16]); BM_V],
     rz: &mut [BmRow],
     ra: &mut [BmRow],

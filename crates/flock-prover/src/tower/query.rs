@@ -1256,10 +1256,14 @@ pub(super) fn emit_opening(
 /// circuits a verifier needs (in registry order via the `*_slot` indices).
 pub struct LeafOuter {
     pub(super) shape: CircuitShape,
-    pub(super) public: Vec<F128>,
-    pub(super) proof: MixedProof,
+    /// `pub`, along with `proof` and `pcs`: a workload's own reference
+    /// tower reads its FL/node outers' publics/proof/pcs straight off
+    /// this — see the leaf extension surface's own first-level-node test,
+    /// in a workload crate outside this one.
+    pub public: Vec<F128>,
+    pub proof: MixedProof,
     pub(super) commitment: Commitment,
-    pub(super) pcs: PcsParams,
+    pub pcs: PcsParams,
     /// The BLAKE3 block, shared process-wide (`chain_blake_r1cs`): every
     /// node at one envelope reads ONE block and ONE compressed lincheck
     /// circuit instead of building and keeping its own ~170 MiB copy.

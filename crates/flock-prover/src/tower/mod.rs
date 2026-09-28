@@ -40,37 +40,56 @@ use {
     crate::tower::node::node_jagged_params,
 };
 
+/// **Extension surface**: what a workload OUTSIDE this crate needs to plug
+/// a new leaf into the tower — implement [`TowerLeaf`] on its own leaf
+/// proof type (as `chain.rs`'s `impl TowerLeaf for ChainProof` does, using
+/// [`MixedInner`]/[`MixedProof`]/[`Online`] to hold the proof and its
+/// deferred verification data), build it under a [`TowerConfig`] with the
+/// same FS domain ([`DOMAIN`]) and PCS batching rule ([`pcs_batch_for`],
+/// [`steady_reps`]) the tower's own leaf uses, then drive
+/// [`Tower::prove_leaves`] and [`TowerVk::from_tower`] the way
+/// [`Tower::prove`] and [`TowerVk::generate`] do. A sibling crate in this
+/// workspace is the reference implementation of a second workload built
+/// entirely on this surface.
+pub use crate::challenger::FsChallenger;
 pub use crate::tower::{
-    chain::{ChainProof, build_chain_proof},
-    config::TowerConfig,
-    driver::{ChainStatement, RootDischargeFailure, Tower},
-    fl_node::{FlNode, build_first_level_node, build_first_level_node_k},
-    node::{ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app},
+    chain::{ChainProof, MixedInner, MixedProof, build_chain_proof},
+    config::{TowerConfig, pcs_batch_for},
+    driver::{
+        AppStatement, ChainStatement, RootDischargeFailure, Tower, TowerCosts, native_digest_tree,
+    },
+    envelope::steady_reps,
+    fl_node::{
+        FlNode, build_first_level_node, build_first_level_node_k, build_first_level_node_kids,
+        combine_digests,
+    },
+    gates_blake3::DOMAIN,
+    leaf::TowerLeaf,
+    node::{
+        AppKind, ChainLane, MainBlock, NodeOut, SpineIn, build_node_outer_app,
+        build_node_outer_app_kind,
+    },
+    online::{Online, census_kib},
     query::LeafOuter,
     verify::{
         RootBundle, TowerVerifyError, TowerVk, TowerVkFingerprint, verify_root, verify_root_bytes,
     },
 };
-// The wire format (`proof_io`'s tower-root bundle) carries a `MixedProof`.
-pub(crate) use crate::tower::chain::MixedProof;
 use crate::{
-    challenger::FsChallenger,
     prover::UnionSlotProverInput,
     r1cs_hashes::merkle_r1cs::SLOT_WORDS,
     schedule::TableType,
     tower::{
-        chain::{MixedInner, native_chain},
+        chain::native_chain,
         child_walker::{
             ChildSlots, ChildTape, ZskipTapeRec, ZskipWires, check_child_region, emit_child_region,
             expected_child_tail_schedule,
         },
-        config::{
-            leaf_zerocheck_ag, outer_union, outer_zerocheck_ag, pcs_batch_for, tower_fold_grinding,
-        },
+        config::{leaf_zerocheck_ag, outer_union, outer_zerocheck_ag, tower_fold_grinding},
         envelope::{
             ENV_ACC_MAIN_WORDS, EnvShape, EnvTail, declare_envelope_slots, env_acc_chain_base,
             env_acc_main_base, env_app_base, env_pass_base, envelope_shape, outer_lanes,
-            pad_envelope_counts, slot_cached, span_count_word, steady_reps,
+            pad_envelope_counts, slot_cached, span_count_word,
         },
         fl_node::chain_blake_r1cs,
         fold_region::{
@@ -86,8 +105,8 @@ use crate::{
             emit_fiat_shamir_chain_partitioned, flatten_ops, merge_chain,
         },
         gates_blake3::{
-            Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, IV, PARENT, ROOT, digest_words,
-            hash_to_digest, pack_params, pack4, pack8, unpack8,
+            Blake3Gate, CHUNK_END, CHUNK_START, IV, PARENT, ROOT, digest_words, hash_to_digest,
+            pack_params, pack4, pack8, unpack4, unpack8,
         },
         gates_glue::{
             BitSpreadGate, BitSpreadTable, FamilyTransposeTileGate, FamilyTransposeTileTable,
@@ -110,7 +129,6 @@ use crate::{
             emit_ag_point_binding, emit_boolean_reported_check, emit_element_reported_check,
             emit_lagrange_lows, emit_recombination, pin_recombination,
         },
-        online::Online,
         query::{
             check_residual_publics, emit_pow_checks, emit_query_phase, emit_recorded_pow_checks,
             emit_residual_region, leaf_boolean_lcs, leaf_boolean_mats,
@@ -142,6 +160,7 @@ mod gates_leaf;
 mod gates_spine;
 mod geometry;
 mod gkr;
+mod leaf;
 mod node;
 mod online;
 mod query;

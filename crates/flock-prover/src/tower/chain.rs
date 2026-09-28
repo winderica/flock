@@ -12,6 +12,7 @@ use flock_core::{
     lincheck::{LincheckCircuit, LincheckProof},
     pcs::{MergedOpenProof, commit::Commitment},
     proof::{R1csProofCircuitMerged, R1csProofCircuitMergedAg, UnionClassClaims},
+    r1cs::BlockR1cs,
     verifier::{DeferredMatrixWork, FlockVerifyError},
 };
 use flock_hash::blake3_compress;
@@ -39,9 +40,10 @@ use crate::{
     prover::prove_fast_ligerito_union_circuit,
     r1cs_hashes::blake3::generate_witness_batch_major_partial,
     tower::{
-        Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, F128, FsChallenger, HashKind, IV, Online,
-        PcsParams, ROOT, ShapeBuilder, TowerConfig, UnionInstance, UnionSlotProverInput, Wire,
-        chain_blake_r1cs, leaf_zerocheck_ag, pack_params, pack4, pack8, pcs_batch_for, steady_reps,
+        AppKind, Blake3Gate, CHUNK_END, CHUNK_START, DOMAIN, F128, FsChallenger, HashKind, IV,
+        Online, PcsParams, ROOT, ShapeBuilder, TowerConfig, TowerLeaf, UnionInstance,
+        UnionSlotProverInput, Wire, chain_blake_r1cs, leaf_zerocheck_ag, pack_params, pack4, pack8,
+        pcs_batch_for, steady_reps,
     },
     verifier::{
         verify_ligerito_union_circuit, verify_ligerito_union_circuit_ag,
@@ -51,10 +53,12 @@ use crate::{
 
 /// A circuit-union proof by boolean-zerocheck FLAVOR — parallel arms so
 /// the chain leaf and envelope outers. Both forms share all other regions.
-/// `pub(crate)` for the wire format's sake: `proof_io`'s tower-root
-/// bundle carries one.
+/// `pub` for two reasons: the wire format's sake (`proof_io`'s tower-root
+/// bundle carries one) and the leaf extension surface's (a workload crate
+/// outside this one, implementing [`crate::tower::TowerLeaf`] on its own
+/// leaf, constructs one — see [`MixedInner`]).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) enum MixedProof {
+pub enum MixedProof {
     Rs(R1csProofCircuitMerged),
     /// Constructed only where the AG round-1 prover kernel exists
     /// (aarch64); the consuming arms are arch-independent.
@@ -134,15 +138,19 @@ impl MixedProof {
     }
 }
 
-/// A mixed circuit proof and its deferred verification data.
-pub(super) struct MixedInner {
-    pub(super) nu: usize,
-    pub(super) built: BuiltCircuit,
-    pub(super) proof: MixedProof,
-    pub(super) commitment: Commitment,
-    pub(super) pcs: PcsParams,
-    pub(super) work: DeferredMatrixWork,
-    pub(super) sigma: SigmaAssertion,
+/// A mixed circuit proof and its deferred verification data. `pub`, and
+/// every field `pub`, so that a workload crate outside this one can build
+/// one for its own leaf (see [`crate::tower::TowerLeaf::inner`]) — the
+/// same object a leaf-proving builder in that crate assembles after
+/// proving its own union circuit.
+pub struct MixedInner {
+    pub nu: usize,
+    pub built: BuiltCircuit,
+    pub proof: MixedProof,
+    pub commitment: Commitment,
+    pub pcs: PcsParams,
+    pub work: DeferredMatrixWork,
+    pub sigma: SigmaAssertion,
 }
 
 /// Check a single-slot Boolean union whose rows form a BLAKE3 hash chain.
@@ -385,9 +393,9 @@ pub struct ChainProof {
     /// count is a different chain (and FL) circuit digest.
     pub(super) n_blocks: usize,
     /// What the leaf cost, split SETUP vs ONLINE — see [`Online`]. The
-    /// LAST online iteration under steady repetition. Read by the in-file
-    /// `#[test]` benches only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// LAST online iteration under steady repetition — [`TowerLeaf::online`]
+    /// exposes it to the driver's cost ledger; the in-file `#[test]`
+    /// benches also read it directly.
     pub(super) t: Online,
     /// One record per online iteration (1 + steady_reps of them).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -554,6 +562,38 @@ pub fn build_chain_proof(cfg: TowerConfig, h_start: [u32; 16], n_blocks: usize) 
         h_end,
         t: *onlines.last().expect("one online iteration"),
         onlines,
+    }
+}
+
+impl TowerLeaf for ChainProof {
+    fn inner(&self) -> &MixedInner {
+        &self.inner
+    }
+    fn r1cs(&self) -> Arc<BlockR1cs> {
+        chain_blake_r1cs(self.inner.nu)
+    }
+    fn count(&self) -> usize {
+        self.n_blocks
+    }
+    fn app_kind(&self) -> AppKind {
+        AppKind::Chain
+    }
+    fn app_words(&self) -> [F128; 8] {
+        let words =
+            |h: &[u32; 16], j: usize| pack4(h[4 * j..4 * j + 4].try_into().expect("4 words"));
+        std::array::from_fn(|i| {
+            if i < 4 {
+                words(&self.h_start, i)
+            } else {
+                words(&self.h_end, i - 4)
+            }
+        })
+    }
+    fn app_pub_range(&self) -> (usize, usize) {
+        (3, 8)
+    }
+    fn online(&self) -> Online {
+        self.t
     }
 }
 

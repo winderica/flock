@@ -20,11 +20,12 @@ use flock_core::{
     zerocheck::{K_SKIP, multilinear::subspace_denominator_pair},
 };
 use flock_field::PHI_8_TABLE;
+use flock_hash::blake3_compress;
 use flock_transcript::transcript_record::{RecordingChallenger, StreamWord, TranscriptOp as Op};
 #[cfg(test)]
 use {
     crate::tower::{
-        ChainLane, build_chain_proof, build_node_outer_app, gates_blake3::Rng, test_config,
+        ChainLane, build_chain_proof, build_node_outer_app, gates_blake3::Rng, pack4, test_config,
     },
     bincode::serialize,
     std::array::from_fn,
@@ -41,21 +42,22 @@ use crate::{
         fs_chain::IV,
     },
     tower::{
-        BitSpreadGate, BitSpreadTable, Blake3Gate, ChainProof, ChildSlots, ChildTape, DOMAIN,
-        EnvTail, F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FsChallenger, HashKind,
-        LeafOuter, MergedChain, MixedProof, Online, PcsParams, PowMaskGate, PowMaskTable,
-        SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable, TowerConfig, UnionInstance,
-        UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
-        balance_extra_rows, bytes_payload_mask, challenge_word_locs, check_ag_skip_publics,
-        check_child_region, check_fold_publics, check_jagged_fold_publics, cw,
-        emit_ag_point_binding, emit_child_region, emit_fiat_shamir_chain_partitioned,
+        AppKind, BitSpreadGate, BitSpreadTable, Blake3Gate, ChainProof, ChildSlots, ChildTape,
+        DOMAIN, EnvTail, F128, FamilyTransposeTileGate, FamilyTransposeTileTable, FsChallenger,
+        HashKind, LeafOuter, MergedChain, MixedInner, MixedProof, Online, PcsParams, PowMaskGate,
+        PowMaskTable, SLOT_WORDS, ShapeBuilder, SwapGate, SwapTable, TowerConfig, TowerLeaf,
+        UnionInstance, UnionSlotProverInput, Wire, ZskipTapeRec, ZskipWires, assert_chain_replays,
+        balance_extra_rows, bytes_payload_mask, chain::CHAIN_FLAGS, challenge_word_locs,
+        check_ag_skip_publics, check_child_region, check_fold_publics, check_jagged_fold_publics,
+        cw, emit_ag_point_binding, emit_child_region, emit_fiat_shamir_chain_partitioned,
         emit_fold_region, emit_jagged_fold_region, emit_lagrange_lows, emit_recorded_pow_checks,
         env_acc_chain_base, env_app_base, envelope_shape, expected_child_tail_schedule,
         flatten_ops, fold_region_ops, jagged_fold_region_ops, labeled_bytes_payloads,
         live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
-        merge_chain, native_chain, outer_lanes, outer_union, outer_zerocheck_ag, pack4, pack8,
-        pad_envelope_counts, pcs_batch_for, replay_fold_endpoints, replay_jagged_fold_endpoints,
-        span_count_word, steady_reps, tower_fold_grinding,
+        merge_chain, native_chain, outer_lanes, outer_union, outer_zerocheck_ag, pack_params,
+        pack8, pad_envelope_counts, pcs_batch_for, replay_fold_endpoints,
+        replay_jagged_fold_endpoints, span_count_word, steady_reps, tower_fold_grinding, unpack4,
+        unpack8,
     },
     verifier::{verify_ligerito_union_circuit_ag_deferred, verify_ligerito_union_circuit_deferred},
 };
@@ -70,19 +72,28 @@ use crate::{
 // unit sees them write-only.
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct FlNode {
-    pub(super) lo: LeafOuter,
+    /// `pub`: a workload's own reference tower — see
+    /// `TowerVk::from_tower` — and the leaf extension surface's own tests
+    /// (living in a workload crate outside this one, exercising its
+    /// first-level node directly) read the built outer's
+    /// publics/proof/pcs straight off this.
+    pub lo: LeafOuter,
     pub(super) acc: Accumulator,
-    pub(super) stmt_base: usize,
+    /// The 8-word application-statement block's base in `lo.public` —
+    /// `pub` for the same reason as `lo`.
+    pub stmt_base: usize,
     /// The published fold blocks' base: per group `[rho_col | rho_row |
     /// value]` — the accumulator claims a PARENT's lane fold connects to
     /// wire-to-wire (a prior's surface IS this published block).
     pub(super) fold_pub_base: usize,
-    pub(super) h_start: [u32; 16],
-    pub(super) h_end: [u32; 16],
+    /// The node's OWN application statement — the 8 packed F128 words its
+    /// app block carries, in the same layout the root eventually
+    /// publishes (see [`AppKind::compose_native`]).
+    pub(super) app: [F128; 8],
     /// What the FL cost, split SETUP vs ONLINE — see [`Online`]. The LAST
     /// online iteration under steady repetition; everything else in the
-    /// builder is pin/check scaffolding.
-    pub(super) t: Online,
+    /// builder is pin/check scaffolding. `pub` for the same reason as `lo`.
+    pub t: Online,
     /// One record per online iteration (1 + steady_reps of them).
     pub(super) onlines: Vec<Online>,
 }
@@ -98,15 +109,21 @@ pub struct FlNode {
 /// discharges both groups.
 /// The chain layout's jagged params — the count win's per-digest table
 /// owner for the lane, rebuilt exactly as the opening verifier reads it.
+#[cfg(test)]
 pub(super) fn chain_jagged_params(cp: &ChainProof) -> JaggedParams {
+    inner_jagged_params(&cp.inner)
+}
+
+/// [`chain_jagged_params`] for any single-boolean-type leaf inner.
+pub(super) fn inner_jagged_params(inner: &MixedInner) -> JaggedParams {
     let u = UnionInstance::new(
-        &cp.inner.built.shape.registry,
-        cp.inner.built.shape.counts.clone(),
+        &inner.built.shape.registry,
+        inner.built.shape.counts.clone(),
     );
     JaggedParams::from_heights(
         &u.jagged_heights(),
         u.n_log(),
-        cp.inner.commitment.params.m - LOG_PACKING,
+        inner.commitment.params.m - LOG_PACKING,
     )
 }
 
@@ -134,8 +151,14 @@ pub(super) fn chain_blake_r1cs(nu: usize) -> Arc<BlockR1cs> {
 /// of a chain child. The pin/locate scaffolding is per-shape and lives in
 /// [`ChildTape::new`]; this is what an online iteration re-pays (results
 /// discarded — identical by determinism).
+#[allow(dead_code)]
 pub(super) fn record_chain_child_verify(cp: &ChainProof, blake_lc: &dyn LincheckCircuit) {
-    let inner = &cp.inner;
+    record_child_verify(&cp.inner, blake_lc)
+}
+
+/// [`record_chain_child_verify`] for any single-boolean-type child.
+pub(super) fn record_child_verify(inner: &MixedInner, lc: &dyn LincheckCircuit) {
+    let blake_lc = lc;
     let union = UnionInstance::new(
         &inner.built.shape.registry,
         inner.built.shape.counts.clone(),
@@ -171,48 +194,116 @@ pub fn build_first_level_node(cfg: TowerConfig, cp0: &ChainProof, cp1: &ChainPro
     build_first_level_node_k(cfg, &[cp0, cp1])
 }
 
+/// The BLAKE3 params word every digest combine uses: one 64-byte block,
+/// `CHUNK_START | CHUNK_END | ROOT` — a standalone single-block hash.
+pub(super) fn digest_combine_params() -> F128 {
+    pack_params(0, 64, CHAIN_FLAGS)
+}
+
+/// `BLAKE3(a ‖ b)` as the tower's digest tree combines: one compression
+/// under the IV with [`digest_combine_params`], output `out_lo`.
+pub fn combine_digests(a: &[u32; 8], b: &[u32; 8]) -> [u32; 8] {
+    let mut m = [0u32; 16];
+    m[..8].copy_from_slice(a);
+    m[8..].copy_from_slice(b);
+    let out = blake3_compress(&IV, &m, 0, 64, CHAIN_FLAGS);
+    out[..8].try_into().expect("out_lo")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl FlNode {
+    /// The chain span this FL publishes, decoded from its 8-word app
+    /// statement — meaningful only on a chain FL (harmless, just not
+    /// meaningful, to call on a digest FL).
+    pub(super) fn h_start(&self) -> [u32; 16] {
+        let mut out = [0u32; 16];
+        for j in 0..4 {
+            out[4 * j..4 * j + 4].copy_from_slice(&unpack4(self.app[j]));
+        }
+        out
+    }
+    pub(super) fn h_end(&self) -> [u32; 16] {
+        let mut out = [0u32; 16];
+        for j in 0..4 {
+            out[4 * j..4 * j + 4].copy_from_slice(&unpack4(self.app[4 + j]));
+        }
+        out
+    }
+    /// The digest this FL publishes, decoded from its 8-word app
+    /// statement — meaningful only on a digest FL. `pub` for the same
+    /// reason `lo` is.
+    pub fn digest(&self) -> [u32; 8] {
+        unpack8(self.app[0], self.app[1])
+    }
+}
+
+/// The 2-ary first-level node over two CHAIN leaves — see
+/// [`build_first_level_node_kids`] for the generic body.
+pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
+    let kids: Vec<&dyn TowerLeaf> = cps.iter().map(|cp| *cp as &dyn TowerLeaf).collect();
+    build_first_level_node_kids(cfg, &kids)
+}
+
 /// The 2-ary first-level node: two adjacent chain proofs verified deferred
 /// in ONE outer, their assertions folded 2→1 per group, adjacency as one
 /// four-word seam, the app statement the combined span. The `cps` slice is
 /// the arity LEVER, but today it is pinned to exactly two children — the
 /// split-BLAKE slot assignment (`ChildSlots::new_env` sets `b3_alt` for
 /// child 1 only) has no slots for a third child.
-pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode {
+/// The 2-ary first-level node, generic in the LEAF: two children of one
+/// single-boolean-type workload verified deferred in ONE outer, their
+/// assertions folded 2→1 per group, and their app statements composed per
+/// [`AppKind`] — the chain's four-word seam + combined span, or the digest
+/// tree's one BLAKE3 combine. The `kids` slice is the arity LEVER, but today
+/// it is pinned to exactly two children — the split-BLAKE slot assignment
+/// (`ChildSlots::new_env` sets `b3_alt` for child 1 only) has no slots for a
+/// third child.
+pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) -> FlNode {
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
 
-    let k_ary = cps.len();
+    let k_ary = kids.len();
     assert_eq!(
         k_ary, 2,
         "split-BLAKE recursion supports exactly two children"
     );
-    let cp0 = cps[0];
-    let cp_last = cps[k_ary - 1];
-    // Each child CONTINUES the chain: its h_start IS the previous h_end.
-    for pair in cps.windows(2) {
-        assert_eq!(pair[1].h_start, pair[0].h_end, "the segments are adjacent");
+    let kind = kids[0].app_kind();
+    assert!(
+        kids.iter().all(|k| k.app_kind() == kind),
+        "one workload kind per FL"
+    );
+    let inners: Vec<&MixedInner> = kids.iter().map(|k| k.inner()).collect();
+    let cp0 = inners[0];
+    // Chain children CONTINUE each other: h_start IS the previous h_end —
+    // read generically off each leaf's own (raw, uncombined) app words,
+    // which for a chain leaf ARE `[h_start x4 | h_end x4]`.
+    if let AppKind::Chain = kind {
+        for pair in kids.windows(2) {
+            let (a, b) = (pair[0].app_words(), pair[1].app_words());
+            assert_eq!(&a[4..8], &b[0..4], "the segments are adjacent");
+        }
     }
-    for cp in &cps[1..] {
+    for inner in &inners[1..] {
         assert_eq!(
-            cp0.inner.built.shape.circuit.digest(),
-            cp.inner.built.shape.circuit.digest(),
-            "one chain circuit digest, every segment"
+            cp0.built.shape.circuit.digest(),
+            inner.built.shape.circuit.digest(),
+            "one leaf circuit digest, every child"
         );
     }
 
-    let registry = &cp0.inner.built.shape.registry;
-    assert_eq!(registry.num_boolean(), 1, "one boolean type (blake3)");
+    let registry = &cp0.built.shape.registry;
+    assert_eq!(registry.num_boolean(), 1, "one boolean type");
     assert!(
         registry.element_types().is_empty(),
-        "the chain class has no element side"
+        "the leaf class has no element side"
     );
-    let bool_asserts: Vec<_> = cps
+    let bool_asserts: Vec<_> = inners
         .iter()
-        .map(|cp| cp.inner.work.boolean.clone().expect("child boolean work"))
+        .map(|inner| inner.work.boolean.clone().expect("child boolean work"))
         .collect();
-    let sigmas: Vec<_> = cps.iter().map(|cp| cp.inner.sigma.clone()).collect();
+    let sigmas: Vec<_> = inners.iter().map(|inner| inner.sigma.clone()).collect();
 
     // ---- the native fold: boolean + sigma, NO element groups, NO priors ----
-    let blake_r1cs = chain_blake_r1cs(cp0.inner.nu);
+    let blake_r1cs = kids[0].r1cs();
     let blake_lc = blake_r1cs.csc_lincheck_circuit();
     let mats = [(&blake_r1cs.a_0, &blake_r1cs.b_0)];
     let el_mats: [ElementMatrices; 0] = [];
@@ -221,14 +312,14 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
     // THE JAGGED GROUP (the count win): the chain children's W-claims fold
     // under the chain digest — the layout is a shape constant of the ONE
     // chain circuit, rebuilt here exactly as the opening verifier reads it.
-    let chain_digest = cp0.inner.built.shape.circuit.digest();
-    let chain_union_j = UnionInstance::new(registry, cp0.inner.built.shape.counts.clone());
+    let chain_digest = cp0.built.shape.circuit.digest();
+    let chain_union_j = UnionInstance::new(registry, cp0.built.shape.counts.clone());
     let chain_params_j = JaggedParams::from_heights(
         &chain_union_j.jagged_heights(),
         chain_union_j.n_log(),
-        cp0.inner.commitment.params.m - LOG_PACKING,
+        cp0.commitment.params.m - LOG_PACKING,
     );
-    let jags: Vec<_> = cps.iter().map(|cp| &cp.inner.work.jagged).collect();
+    let jags: Vec<_> = inners.iter().map(|inner| &inner.work.jagged).collect();
     let jagged_p: Vec<JaggedKeyProve<'_>> = vec![(chain_digest, &chain_params_j, jags.to_vec())];
     let jagged_v: Vec<JaggedKeyVerify<'_>> = vec![(chain_digest, jags.to_vec())];
     let mut chp = FsChallenger::with_chained_blake3(FL_DOMAIN);
@@ -239,7 +330,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         &bool_asserts,
         &el_mats,
         &el_asserts,
-        &[(&cp0.inner.built.shape.circuit, sigmas.iter().collect())],
+        &[(&cp0.built.shape.circuit, sigmas.iter().collect())],
         &jagged_p,
         &[],
         tower_fold_grinding(cfg),
@@ -251,7 +342,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         registry,
         &bool_asserts,
         &el_asserts,
-        &[(&cp0.inner.built.shape.circuit, sigmas.iter().collect())],
+        &[(&cp0.built.shape.circuit, sigmas.iter().collect())],
         &jagged_v,
         &[],
         &agg,
@@ -263,7 +354,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
     assert!(acc_v.per_element.is_empty(), "no element group accumulated");
     assert!(acc_v.discharge(&mats), "the boolean group discharges");
     assert!(
-        acc_v.discharge_sigma(&[&cp0.inner.built.shape.circuit]),
+        acc_v.discharge_sigma(&[&cp0.built.shape.circuit]),
         "the sigma group discharges against the ONE chain circuit"
     );
     assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the chain layout");
@@ -336,7 +427,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
     assert_eq!(outs[2], *sig_claim, "sigma accumulator");
     assert_eq!(
         *sig_digest,
-        cp0.inner.built.shape.circuit.digest(),
+        cp0.built.shape.circuit.digest(),
         "sigma keys by the chain circuit digest"
     );
     let jouts = replay_jagged_fold_endpoints(&jlocs, vals_rec, chals);
@@ -346,9 +437,9 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
     );
 
     // ---- the child tapes ----
-    let tapes: Vec<ChildTape> = cps
+    let tapes: Vec<ChildTape> = inners
         .iter()
-        .map(|cp| ChildTape::new(&cp.inner, DOMAIN))
+        .map(|inner| ChildTape::new_with_lincheck(inner, DOMAIN, blake_lc))
         .collect();
     assert!(tapes.iter().all(|t| t.el.is_none()), "chain children");
 
@@ -744,7 +835,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
                         [tk.chals[*seed_ch], tk.chals[*seed_ch + 1]],
                         nonce,
                         &pt,
-                        cps[k].inner.pcs.zerocheck_grinding().ag_round_one_bits(),
+                        inners[k].pcs.zerocheck_grinding().ag_round_one_bits(),
                         &mut vals,
                         &mut consts,
                         zw,
@@ -833,19 +924,42 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
             }
         }
 
-        // ---- THE ADJACENCY: each h_end == the next h_start, wire to wire ----
-        // The chain statement is 11 words: [iv0, iv1, params, h_start x4 |
-        // h_end x4 published last]. The children's publics are witness
-        // wires here, so adjacency is four copy constraints per seam, and
-        // the node's own application statement is the combined span.
-        for rk in &regions {
-            assert_eq!(rk.child_pub_w.len(), 11, "the chain statement is 11 words");
+        // ---- THE APPLICATION STATEMENT, by kind ----
+        // Chain: each h_end == the next h_start, wire to wire (the chain
+        // statement is 11 words: [iv0, iv1, params, h_start x4 | h_end x4
+        // published last]; the children's publics are witness wires here,
+        // so adjacency is four copy constraints per seam), and the node's
+        // own statement is the combined span.
+        // Digest: the children's digests hash together with ONE BLAKE3
+        // compression on the shared b3 slot, and the node's statement is
+        // that digest, zero-padded to eight words.
+        // Both cases are [`AppKind::emit_compose`] — the FL and the
+        // internal node share the composition rule; only where
+        // `child_pub_w` and the raw material's offset come from differs.
+        let (app_off, app_len) = kids[0].app_pub_range();
+        assert_eq!(
+            app_len,
+            kind.raw_len(),
+            "the app range's length matches its kind"
+        );
+        for (k, rk) in regions.iter().enumerate() {
+            assert_eq!(
+                rk.child_pub_w.len(),
+                inners[k].built.witness.public.len(),
+                "child {k}'s public block is its whole public segment"
+            );
         }
-        for pair in regions.windows(2) {
-            for j in 0..4 {
-                sb.connect(pair[0].child_pub_w[11 - 4 + j], pair[1].child_pub_w[3 + j]);
-            }
-        }
+        let child_pub_w: Vec<&[Wire]> = regions.iter().map(|r| r.child_pub_w.as_slice()).collect();
+        let app_stmt_w: Vec<Wire> = kind.emit_compose(
+            &mut sb,
+            &child_pub_w,
+            app_off,
+            b3s,
+            iv2,
+            zw,
+            &mut vals,
+            &mut consts,
+        );
 
         // THE INHERITABLE ACCUMULATOR: per fold the deltas + the claim
         // `[rho_col | rho_row | value]`. This is the surface a PARENT's
@@ -873,18 +987,15 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         // declares the same count vector and segment length every other
         // envelope outer does, and both the app block and the accumulator
         // claims ride the envelope's fixed TAIL.
-        let mut app_w: Vec<Wire> = (0..4)
-            .map(|j| regions[0].child_pub_w[3 + j])
-            .chain((0..4).map(|j| regions[k_ary - 1].child_pub_w[11 - 4 + j]))
-            .collect();
+        let mut app_w: Vec<Wire> = app_stmt_w;
         // THE SPAN COUNTER: the base C = g^{n_blocks} rides word 9 as a
         // fixed public — GROUNDED by the parent chain (every parent
         // copy-constrains it to its own, up to the root's native
         // check_public) — and word 8 = C^k via mac rows, so the count is
         // bound by proven relations, not by fixed-public metadata.
-        let per_leaf = cps[0].n_blocks;
+        let per_leaf = kids[0].count();
         assert!(
-            cps.iter().all(|cp| cp.n_blocks == per_leaf),
+            kids.iter().all(|k| k.count() == per_leaf),
             "one leaf size per FL"
         );
         let c_w = cw(
@@ -990,6 +1101,12 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         let family_slot = cs.q.family.expect("family-H slot");
         let family_r1cs2 = FamilyTransposeTileTable::build_block_r1cs(nu2);
         let family_lc2 = family_r1cs2.csc_lincheck_circuit();
+        // The FL's own native app statement — the children's app words,
+        // composed per kind — computed once, checked against the
+        // published block every online iteration and stored as the node's
+        // own `app` field at the end.
+        let kids_words: Vec<[F128; 8]> = kids.iter().map(|k| k.app_words()).collect();
+        let app_words = kind.compose_native(&kids_words);
         // ONLINE, `1 + steady_reps()` iterations over the ONE shape: tapes
         // (the recording verifies, re-run with results discarded — identical
         // by determinism), the walk (fill plan), witness assembly, prove,
@@ -999,8 +1116,8 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
         let mut fin = None;
         for _ in 0..reps {
             let t_tapes = Instant::now();
-            for cp in cps {
-                record_chain_child_verify(cp, blake_lc);
+            for inner in &inners {
+                record_child_verify(inner, blake_lc);
             }
             let tapes_ms_i = t_tapes.elapsed().as_secs_f64() * 1e3;
             let t_run = Instant::now();
@@ -1045,7 +1162,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
                 registry_digest: registry.digest(),
                 per_type: vec![(rebuilt[0].clone(), rebuilt[1].clone())],
                 per_element: Vec::new(),
-                sigma: vec![(cp0.inner.built.shape.circuit.digest(), rebuilt[2].clone())],
+                sigma: vec![(cp0.built.shape.circuit.digest(), rebuilt[2].clone())],
                 jagged: vec![(chain_digest, jrebuilt[0].clone())],
             };
             assert_eq!(
@@ -1054,7 +1171,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
             );
             assert!(
                 acc_pub.discharge(&mats)
-                    && acc_pub.discharge_sigma(&[&cp0.inner.built.shape.circuit])
+                    && acc_pub.discharge_sigma(&[&cp0.built.shape.circuit])
                     && acc_pub.discharge_jagged(&[(chain_digest, &chain_params_j)]),
                 "the public-segment accumulator discharges all three groups"
             );
@@ -1065,40 +1182,46 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
             }
             // The AG-skip blocks: the decode is in-circuit since phase D;
             // the checker holds the nonce range and the row lows.
-            for (cp, base) in cps.iter().zip(&ag_pub_bases) {
+            for (inner, base) in inners.iter().zip(&ag_pub_bases) {
                 if let Some(base) = base {
                     check_ag_skip_publics(
                         &built2.public,
                         *base,
-                        cp.inner.pcs.zerocheck_grinding().ag_round_one_bits(),
+                        inner.pcs.zerocheck_grinding().ag_round_one_bits(),
                     );
                 }
             }
             for &(v, idx) in &jag_const_rec {
                 assert_eq!(built2.public[idx], v, "jagged shared constant public");
             }
-            // THE APPLICATION STATEMENT: the published span is (h_start of the
-            // first chain, h_end of the last) — the combined segment.
-            for j in 0..4 {
+            // THE APPLICATION STATEMENT, natively: the published block is
+            // the composed statement of the children.
+            for j in 0..8 {
                 assert_eq!(
                     built2.public[stmt_base + j],
-                    pack4(cp0.h_start[4 * j..4 * j + 4].try_into().unwrap()),
-                    "node statement: h_start is the first child's"
-                );
-                assert_eq!(
-                    built2.public[stmt_base + 4 + j],
-                    pack4(cp_last.h_end[4 * j..4 * j + 4].try_into().unwrap()),
-                    "node statement: h_end is the last child's"
+                    app_words[j],
+                    "node statement word {j}"
                 );
             }
-            assert_eq!(
-                cp_last.h_end,
-                native_chain(
-                    &cp0.h_start,
-                    cps.iter().map(|cp| cp.inner.built.shape.counts[0]).sum(),
-                ),
-                "the combined span IS the concatenated chain"
-            );
+            if let AppKind::Chain = kind {
+                let decode = |w: [F128; 8], base: usize| -> [u32; 16] {
+                    let mut out = [0u32; 16];
+                    for j in 0..4 {
+                        out[4 * j..4 * j + 4].copy_from_slice(&unpack4(w[base + j]));
+                    }
+                    out
+                };
+                let h_start = decode(kids_words[0], 0);
+                let h_end = decode(app_words, 4);
+                assert_eq!(
+                    h_end,
+                    native_chain(
+                        &h_start,
+                        inners.iter().map(|i| i.built.shape.counts[0]).sum(),
+                    ),
+                    "the combined span IS the concatenated chain"
+                );
+            }
 
             // Everything from here to the prove is WITNESS ASSEMBLY — packing
             // the walk's rows into the union's slot inputs. It is per-statement
@@ -1287,8 +1410,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
             acc: acc_pub,
             stmt_base,
             fold_pub_base,
-            h_start: cp0.h_start,
-            h_end: cp_last.h_end,
+            app: app_words,
             t: *onlines.last().expect("one online iteration"),
             onlines,
         }
@@ -1308,17 +1430,17 @@ pub(super) fn first_level_node_two_chains_fold_and_adjacency() {
     let cp0 = build_chain_proof(cfg, h0, n_blocks);
     let cp1 = build_chain_proof(cfg, cp0.h_end, n_blocks);
     let fl = build_first_level_node(cfg, &cp0, &cp1);
-    assert_eq!(fl.h_start, cp0.h_start);
-    assert_eq!(fl.h_end, cp1.h_end);
+    assert_eq!(fl.h_start(), cp0.h_start);
+    assert_eq!(fl.h_end(), cp1.h_end);
     for j in 0..4 {
         assert_eq!(
             fl.lo.public[fl.stmt_base + j],
-            pack4(fl.h_start[4 * j..4 * j + 4].try_into().unwrap()),
+            pack4(fl.h_start()[4 * j..4 * j + 4].try_into().unwrap()),
             "the statement block reads h_start out of the public segment"
         );
         assert_eq!(
             fl.lo.public[fl.stmt_base + 4 + j],
-            pack4(fl.h_end[4 * j..4 * j + 4].try_into().unwrap()),
+            pack4(fl.h_end()[4 * j..4 * j + 4].try_into().unwrap()),
             "the statement block reads h_end out of the public segment"
         );
     }

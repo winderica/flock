@@ -254,7 +254,7 @@ pub(crate) fn identity(k: usize) -> SparseBinaryMatrix {
 /// R1CS builds. Encoders that set it MUST fill padding blocks with valid
 /// (constant = 1) computations.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_block_r1cs_with_matrices(
+pub fn build_block_r1cs_with_matrices(
     n_blocks_log: usize,
     k_log: usize,
     k_skip: usize,
@@ -481,10 +481,12 @@ pub(crate) fn xor_dedup(mut v: Vec<usize>) -> Vec<usize> {
 // ---------------------------------------------------------------------------
 
 /// Instances per lockstep group (= one lincheck-stripe group; one chunk-row
-/// emission = 128 B).
-pub(crate) const BM_V: usize = 8;
+/// emission = 128 B). `pub`: a workload's own fused hash table, built as a
+/// separate crate outside this one, drives its witness through the same
+/// batch-major producer contract.
+pub const BM_V: usize = 8;
 /// One interleaved word-row: the same block-u64 index across BM_V instances.
-pub(crate) type BmRow = [u64; BM_V];
+pub type BmRow = [u64; BM_V];
 
 /// Raw-pointer wrapper for the disjoint per-group strided writes.
 #[derive(Copy, Clone)]
@@ -502,7 +504,7 @@ impl SendPtr {
 /// V-wide `or_u32_at_bit`: OR the V instances' 32-bit values into row `w`
 /// (and `w + 1` on straddle) at bit offset `bit`.
 #[inline(always)]
-pub(crate) fn or_u32_row(rows: &mut [BmRow], bit: usize, vals: &[u32; BM_V]) {
+pub fn or_u32_row(rows: &mut [BmRow], bit: usize, vals: &[u32; BM_V]) {
     let w = bit >> 6;
     let s = bit & 63;
     for j in 0..BM_V {
@@ -517,7 +519,7 @@ pub(crate) fn or_u32_row(rows: &mut [BmRow], bit: usize, vals: &[u32; BM_V]) {
 
 /// V-wide `or_bit_at`: set bit `bit` in every instance's row.
 #[inline(always)]
-pub(crate) fn or_bit_row(rows: &mut [BmRow], bit: usize) {
+pub fn or_bit_row(rows: &mut [BmRow], bit: usize) {
     let w = bit >> 6;
     let s = bit & 63;
     for j in 0..BM_V {
@@ -834,7 +836,7 @@ where
 ///
 /// Thin allocating wrapper over [`drive_witness_batch_major_partial_into`] —
 /// see [`drive_witness_batch_major`] for the same split.
-pub(crate) fn drive_witness_batch_major_partial<S: Sync, F>(
+pub fn drive_witness_batch_major_partial<S: Sync, F>(
     inputs: &[S],
     n_blocks_log: usize,
     k_log: usize,
@@ -868,7 +870,7 @@ where
 /// [`drive_witness_batch_major_partial`] writing into a caller-supplied
 /// destination — the union counterpart, see
 /// [`drive_witness_batch_major_into`].
-pub(crate) fn drive_witness_batch_major_partial_into<S: Sync, F>(
+pub fn drive_witness_batch_major_partial_into<S: Sync, F>(
     inputs: &[S],
     n_blocks_log: usize,
     k_log: usize,

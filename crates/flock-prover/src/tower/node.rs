@@ -13,7 +13,7 @@ use bincode::serialize;
 use flock_core::{
     aggregate,
     aggregate::{Accumulator, TypeMatrices},
-    circuit::{Circuit, WiringError},
+    circuit::{Circuit, WiringError, builder::SlotId},
     element_r1cs::union::ElementAssertion,
     lincheck::{LincheckCircuit, SkipPoint},
     matrix_fold::{FoldProof, JaggedAssertion, JaggedClaim},
@@ -52,16 +52,18 @@ use crate::{
         TowerConfig, UnionInstance, UnionSlotProverInput, Weight, Wire, ZskipTapeRec, ZskipWires,
         assert_chain_replays, balance_extra_rows, bytes_payload_mask, challenge_word_locs,
         check_ag_skip_publics, check_fold_publics, check_jagged_fold_publics,
-        check_real_child_region, cw, emit_ag_point_binding, emit_fiat_shamir_chain,
+        check_real_child_region, cw, digest_words, emit_ag_point_binding, emit_fiat_shamir_chain,
         emit_fiat_shamir_chain_partitioned, emit_fold_region, emit_jagged_fold_region,
         emit_lagrange_lows, emit_real_child_region, emit_recorded_pow_checks, env_acc_chain_base,
         env_acc_main_base, env_app_base, env_pass_base, envelope_shape,
-        expected_real_tail_schedule, fl_node::chain_blake_r1cs, flatten_ops, fold_region_ops,
-        jagged_fold_region_ops, labeled_bytes_payloads, leaf_boolean_lcs, leaf_boolean_mats,
-        live_element_input_from_rows, locate_and_pin_folds, locate_and_pin_jagged_folds,
-        merge_chain, outer_lanes, outer_union, outer_zerocheck_ag, pack8, pad_envelope_counts,
-        payload_words, pcs_batch_for, read_acc_entry, replay_fold_endpoints,
-        replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+        expected_real_tail_schedule,
+        fl_node::{chain_blake_r1cs, combine_digests, digest_combine_params},
+        flatten_ops, fold_region_ops, jagged_fold_region_ops, labeled_bytes_payloads,
+        leaf_boolean_lcs, leaf_boolean_mats, live_element_input_from_rows, locate_and_pin_folds,
+        locate_and_pin_jagged_folds, merge_chain, outer_lanes, outer_union, outer_zerocheck_ag,
+        pack8, pad_envelope_counts, payload_words, pcs_batch_for, read_acc_entry,
+        replay_fold_endpoints, replay_jagged_fold_endpoints, steady_reps, tower_fold_grinding,
+        unpack8,
     },
 };
 
@@ -242,6 +244,130 @@ pub fn build_node_outer_app(
     cfg: TowerConfig,
     los: &[&LeafOuter],
     app_stmt: Option<usize>,
+    lane: Option<ChainLane<'_>>,
+    spine: Option<SpineIn<'_>>,
+) -> NodeOut {
+    build_node_outer_app_kind(cfg, los, app_stmt, AppKind::Chain, lane, spine)
+}
+
+/// How a node COMPOSES its children's application blocks into its own.
+/// Constant per tower — the internal node's circuit digest must not move
+/// across spine levels, and this is part of that shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppKind {
+    /// Hash-chain adjacency: `left.h_end == right.h_start` wire-to-wire,
+    /// the node's span is `(first.h_start, last.h_end)`.
+    Chain,
+    /// Digest tree: the node's digest is ONE BLAKE3 compression over its
+    /// children's digests (app words 0-1), zero-padded to eight words.
+    Digest,
+}
+
+impl AppKind {
+    /// The RAW app material's length inside a leaf's own public segment
+    /// for this kind — see [`crate::tower::leaf::TowerLeaf::app_pub_range`].
+    pub(super) fn raw_len(self) -> usize {
+        match self {
+            AppKind::Chain => 8,
+            AppKind::Digest => 2,
+        }
+    }
+
+    /// IN-CIRCUIT: compose every child's app material — each child's RAW
+    /// slice starting at `off` in its own public segment, `child_pub_w[k]`
+    /// being that child's whole public segment as witness wires — into
+    /// THIS node's own 8-word app statement. Chain adjacency is wire
+    /// connects only (no new gate); the digest tree spends one BLAKE3
+    /// compression on `b3_slot`. Shared by the first-level node
+    /// ([`crate::tower::fl_node::build_first_level_node_kids`]) and every
+    /// internal node ([`build_node_outer_app_kind`]) — the only difference
+    /// between the two call sites is where `child_pub_w` and `off` come
+    /// from.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_compose(
+        self,
+        sb: &mut ShapeBuilder,
+        child_pub_w: &[&[Wire]],
+        off: usize,
+        b3_slot: SlotId,
+        iv2: [Wire; 2],
+        zw: Wire,
+        vals: &mut Vec<F128>,
+        consts: &mut Vec<(F128, Wire)>,
+    ) -> Vec<Wire> {
+        match self {
+            AppKind::Chain => {
+                // ADJACENCY CHAINS ACROSS EVERY CONSECUTIVE PAIR: child
+                // i's h_end is child i+1's h_start, so the composed span
+                // is the first child's h_start and the last child's
+                // h_end — the same statement whatever the arity.
+                for w in child_pub_w.windows(2) {
+                    for j in 0..4 {
+                        sb.connect(w[0][off + 4 + j], w[1][off + j]);
+                    }
+                }
+                let last = child_pub_w[child_pub_w.len() - 1];
+                (0..4)
+                    .map(|j| child_pub_w[0][off + j])
+                    .chain((0..4).map(|j| last[off + 4 + j]))
+                    .collect()
+            }
+            AppKind::Digest => {
+                // D = BLAKE3(D_0 ‖ D_1 ‖ …) — one compression over the
+                // children's digest words, on the shared b3 slot.
+                assert_eq!(child_pub_w.len(), 2, "the digest combine is 2-ary");
+                let params_w = cw(sb, vals, consts, digest_combine_params());
+                let mut m: Vec<Wire> = vec![iv2[0], iv2[1]];
+                for rk in child_pub_w {
+                    m.push(rk[off]);
+                    m.push(rk[off + 1]);
+                }
+                m.push(params_w);
+                let o = sb.gate(b3_slot, &m);
+                let mut v = vec![o[0], o[1]];
+                v.extend(std::iter::repeat_n(zw, 6));
+                v
+            }
+        }
+    }
+
+    /// NATIVELY: the same composition over already-decoded 8-word app
+    /// statements — a leaf's own [`crate::tower::leaf::TowerLeaf::app_words`],
+    /// or a node's own published app words one level down.
+    pub(super) fn compose_native(self, kids: &[[F128; 8]]) -> [F128; 8] {
+        match self {
+            AppKind::Chain => {
+                let (first, last) = (kids[0], kids[kids.len() - 1]);
+                [
+                    first[0], first[1], first[2], first[3], last[4], last[5], last[6], last[7],
+                ]
+            }
+            AppKind::Digest => {
+                assert_eq!(kids.len(), 2, "the digest combine is 2-ary");
+                let a = unpack8(kids[0][0], kids[0][1]);
+                let b = unpack8(kids[1][0], kids[1][1]);
+                let dw = digest_words(&combine_digests(&a, &b));
+                [
+                    dw[0],
+                    dw[1],
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                    F128::ZERO,
+                ]
+            }
+        }
+    }
+}
+
+/// [`build_node_outer_app`] with the app-block composition rule chosen.
+pub fn build_node_outer_app_kind(
+    cfg: TowerConfig,
+    los: &[&LeafOuter],
+    app_stmt: Option<usize>,
+    app_kind: AppKind,
     lane: Option<ChainLane<'_>>,
     spine: Option<SpineIn<'_>>,
 ) -> NodeOut {
@@ -1672,16 +1798,17 @@ pub fn build_node_outer_app(
         // child's h_start and the last child's h_end — the same statement
         // whatever the arity.
         let app_w: Option<Vec<Wire>> = app_stmt.map(|off| {
-            for w in regions.windows(2) {
-                for j in 0..4 {
-                    sb.connect(w[0].child_pub_w[off + 4 + j], w[1].child_pub_w[off + j]);
-                }
-            }
-            let last = &regions[n_kids - 1];
-            let mut out: Vec<Wire> = (0..4)
-                .map(|j| regions[0].child_pub_w[off + j])
-                .chain((0..4).map(|j| last.child_pub_w[off + 4 + j]))
-                .collect();
+            let pubs: Vec<&[Wire]> = regions.iter().map(|r| r.child_pub_w.as_slice()).collect();
+            let mut out: Vec<Wire> = app_kind.emit_compose(
+                &mut sb,
+                &pubs,
+                off,
+                cs.q.b3,
+                iv2,
+                zw,
+                &mut vals,
+                &mut consts,
+            );
             // THE SPAN COUNTER composes MULTIPLICATIVELY: the node's word
             // is the product of its children's (g^{a+b} = g^a · g^b), one
             // MAC row per extra child — depth never enters the shape.
@@ -2977,7 +3104,7 @@ pub(super) fn internal_node_over_two_first_level_nodes() {
         "one first-level circuit digest — the FL shape is data-independent"
     );
     assert_eq!(fl0.stmt_base, fl1.stmt_base, "one statement offset");
-    assert_eq!(fl1.h_start, fl0.h_end, "the FL spans are adjacent");
+    assert_eq!(fl1.h_start(), fl0.h_end(), "the FL spans are adjacent");
 
     let out = build_node_outer_app(cfg, &[&fl0.lo, &fl1.lo], Some(fl0.stmt_base), None, None);
     let (node, acc, app) = (out.lo, out.acc, out.app_base);

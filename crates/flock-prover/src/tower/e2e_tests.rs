@@ -13,9 +13,9 @@ use flock_core::{
 use crate::{
     r1cs_hashes::blake3::build_block_r1cs,
     tower::{
-        ChainLane, ChainProof, DOMAIN, F128, FlNode, FsChallenger, LeafOuter, Online, RootBundle,
-        RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError, TowerVk,
-        UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
+        ChainLane, ChainProof, ChainStatement, DOMAIN, F128, FlNode, FsChallenger, LeafOuter,
+        Online, RootBundle, RootDischargeFailure, SpineIn, Tower, TowerConfig, TowerVerifyError,
+        TowerVk, UnionInstance, build_chain_proof, build_first_level_node, build_node_outer_app,
         chain_blake_r1cs, chain_jagged_params, env_acc_chain_base, env_acc_main_base, env_app_base,
         env_pass_base,
         envelope::STEADY_OVERRIDE,
@@ -998,17 +998,14 @@ pub(super) fn tower_driver_e2e() {
     let h0: [u32; 16] = from_fn(|_| rng.next_u32());
 
     let mut tower = Tower::prove(cfg, h0, n_blocks, 8);
+    let st = ChainStatement::from_app(tower.statement());
+    assert_eq!(st.h_start, h0, "the statement starts where the caller did");
     assert_eq!(
-        tower.statement().h_start,
-        h0,
-        "the statement starts where the caller did"
-    );
-    assert_eq!(
-        tower.statement().h_end,
+        st.h_end,
         native_chain(&h0, 8 * n_blocks),
         "the driver's statement IS the chain"
     );
-    assert_eq!(tower.statement().n_blocks, 8 * n_blocks);
+    assert_eq!(st.n_blocks, 8 * n_blocks);
     tower.discharge_root().expect("the honest root discharges");
 
     // (a) a doctored statement word (the root's published h_end).
@@ -1182,8 +1179,9 @@ pub(super) fn tower_verify_root_e2e() {
     );
     // A wrong statement (honest proof, different claim) dies on the
     // statement binding.
-    let mut wrong = stmt;
-    wrong.h_end[0] ^= 1;
+    let mut wrong_c = ChainStatement::from_app(&stmt);
+    wrong_c.h_end[0] ^= 1;
+    let wrong = wrong_c.to_app();
     assert!(
         matches!(
             verify_root(&vk, &wrong, &tower.root_bundle()),
@@ -1206,8 +1204,9 @@ pub(super) fn tower_verify_root_e2e() {
         "a truncated bundle must die on the length guard"
     );
     // A span that is not a whole number of leaf pairs dies on geometry.
-    let mut misfit = stmt;
-    misfit.n_blocks += 1;
+    let mut misfit_c = ChainStatement::from_app(&stmt);
+    misfit_c.n_blocks += 1;
+    let misfit = misfit_c.to_app();
     assert!(
         matches!(
             verify_root(&vk, &misfit, &tower.root_bundle()),
@@ -1241,8 +1240,9 @@ pub(super) fn tower_verify_root_e2e() {
     // in the app block pins the count inside the class (this exact lie
     // used to verify, which is why verify_root once answered
     // EndpointsOnly).
-    let mut inflated = stmt;
-    inflated.n_blocks += 2 * 2 * n_blocks;
+    let mut inflated_c = ChainStatement::from_app(&stmt);
+    inflated_c.n_blocks += 2 * 2 * n_blocks;
+    let inflated = inflated_c.to_app();
     assert!(
         matches!(
             verify_root(&vk, &inflated, &tower.root_bundle()),
@@ -1257,8 +1257,9 @@ pub(super) fn tower_verify_root_e2e() {
     // A CROSS-CLASS span lie now dies on the statement leg too (the
     // counter mismatches before the passenger rule is consulted; the
     // passenger rule stays as structural defense-in-depth).
-    let mut lied = *t3.statement();
-    lied.n_blocks += 2 * n_blocks;
+    let mut lied_c = ChainStatement::from_app(t3.statement());
+    lied_c.n_blocks += 2 * n_blocks;
+    let lied = lied_c.to_app();
     assert!(
         matches!(
             verify_root(&vk, &lied, &t3.root_bundle()),

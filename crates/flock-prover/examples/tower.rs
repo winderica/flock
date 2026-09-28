@@ -17,7 +17,7 @@
 
 use std::{env, time::Instant};
 
-use flock_prover::tower::{Tower, TowerConfig, TowerVk, verify_root_bytes};
+use flock_prover::tower::{ChainStatement, Tower, TowerConfig, TowerVk, verify_root_bytes};
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -52,7 +52,7 @@ fn main() {
         .expect("the root-side residue discharges");
     let discharge_s = t1.elapsed().as_secs_f64();
 
-    let s = tower.statement();
+    let s = &ChainStatement::from_app(tower.statement());
     println!(
         "\nTOWER {:?}: {n_leaves} leaves x {blocks_per_leaf} compressions = {} total\n  \
          h_end = {:08x}{:08x}.. (== H^{}(h_start))\n  \
@@ -73,7 +73,11 @@ fn main() {
         let t3 = Instant::now();
         let stmt = verify_root_bytes(&vk, &bytes).expect("the wire bundle verifies standalone");
         let verify_s = t3.elapsed().as_secs_f64();
-        assert_eq!(&stmt, s, "the statement rode the wire");
+        assert_eq!(
+            &ChainStatement::from_app(&stmt),
+            s,
+            "the statement rode the wire"
+        );
         println!(
             "  VERIFIED STANDALONE (consumer path, over the wire): bundle {:.1} KiB \
              | vk generate {gen_s:.1}s (one-time) | verify {verify_s:.3}s | statement certified",

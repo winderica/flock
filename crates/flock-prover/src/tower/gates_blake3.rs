@@ -13,7 +13,9 @@ use crate::{
     tower::{F128, GateType, SLOT_WORDS, SlotWitness, TableType},
 };
 
-pub(super) const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
+/// The tower's FS domain — `pub` so a workload crate outside this one can
+/// chain its own leaf's challenger under the same domain.
+pub const DOMAIN: &[u8] = b"flock-circuit-merkle-v0";
 
 pub(super) const CHUNK_START: u32 = 1 << 0;
 pub(super) const CHUNK_END: u32 = 1 << 1;

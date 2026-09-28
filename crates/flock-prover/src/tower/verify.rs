@@ -26,15 +26,17 @@ use flock_core::{
     aggregate::Accumulator, matrix_fold::MatrixClaim, pcs::Commitment, verifier::FlockVerifyError,
 };
 
-use crate::proof_io::{DeserializeError, TowerRootBundle};
-use crate::tower::{
-    DOMAIN, F128, FsChallenger, MixedProof, TowerConfig,
-    driver::{ChainStatement, RootDischargeFailure, Tower},
-    env_acc_main_base, env_pass_base, envelope_shape,
-    fold_region::read_acc_entry,
-    node::{N_KEY_SLOTS, digest_f128, entry_live},
-    outer_union,
-    query::{LeafOuter, leaf_boolean_lcs},
+use crate::{
+    proof_io::{DeserializeError, TowerRootBundle},
+    tower::{
+        DOMAIN, F128, FsChallenger, MixedProof, TowerConfig,
+        driver::{AppStatement, RootDischargeFailure, Tower},
+        env_acc_main_base, env_pass_base, envelope_shape,
+        fold_region::read_acc_entry,
+        node::{AppKind, N_KEY_SLOTS, digest_f128, entry_live},
+        outer_union,
+        query::{LeafOuter, leaf_boolean_lcs},
+    },
 };
 
 /// The ROOT'S TRANSPORTABLE PART: what a consumer holds beside the
@@ -135,17 +137,32 @@ pub struct TowerVk {
 }
 
 impl TowerVk {
-    /// OPTION-A GENERATION: prove a minimal six-leaf tower and keep it.
-    /// Six leaves is the smallest run that materializes all four shapes
-    /// (chain, FL, base, steady = the k = 3 root).
-    pub fn generate(cfg: TowerConfig, blocks_per_leaf: usize) -> TowerVk {
-        let tower = Tower::prove(cfg, [0u32; 16], blocks_per_leaf, 6);
+    /// Build a VK from an already-proven REFERENCE TOWER — shared by
+    /// [`Self::generate`] (the BLAKE3 chain) and a workload's own VK
+    /// constructor, living in a crate outside this one: any tower
+    /// reaching all four shapes (chain, FL, base, steady) at its
+    /// `(cfg, blocks_per_leaf)` works, whatever the workload — the decode
+    /// plan and the leaf size both come straight off the tower.
+    pub fn from_tower(tower: Tower) -> TowerVk {
         let layout = AccLayout::from_tower(&tower);
+        let blocks_per_leaf = tower.blocks_per_leaf;
         TowerVk {
             tower,
             layout,
             blocks_per_leaf,
         }
+    }
+
+    /// OPTION-A GENERATION: prove a minimal six-leaf tower and keep it.
+    /// Six leaves is the smallest run that materializes all four shapes
+    /// (chain, FL, base, steady = the k = 3 root).
+    pub fn generate(cfg: TowerConfig, blocks_per_leaf: usize) -> TowerVk {
+        Self::from_tower(Tower::prove(cfg, [0u32; 16], blocks_per_leaf, 6))
+    }
+
+    /// The workload this VK verifies.
+    pub fn app_kind(&self) -> AppKind {
+        self.tower.app_kind()
     }
 }
 
@@ -227,7 +244,7 @@ pub(super) fn reassemble(
         .collect();
 
     // ---- ACC_CHAIN: the lane's un-keyed layout, key implied ----
-    let chain_d = vk.tower.chain.inner.built.shape.circuit.digest();
+    let chain_d = vk.tower.chain.inner().built.shape.circuit.digest();
     let mut p = l.lane_base;
     let mut lflat: Vec<MatrixClaim> = Vec::with_capacity(l.lane_unkeyed.len());
     for &(kc, kr) in &l.lane_unkeyed {
@@ -243,7 +260,7 @@ pub(super) fn reassemble(
     let (_, lsig) = read_acc_entry(public, &mut p, false, l.lane_sigma_w.0, l.lane_sigma_w.1);
     let (_, ljag) = read_acc_entry(public, &mut p, false, l.lane_jagged_w.0, l.lane_jagged_w.1);
     let lane = Accumulator {
-        registry_digest: vk.tower.chain.inner.built.shape.registry.digest(),
+        registry_digest: vk.tower.chain.inner().built.shape.registry.digest(),
         per_type: lane_per_type,
         per_element: Vec::new(),
         sigma: vec![(chain_d, lsig)],
@@ -266,16 +283,20 @@ pub(super) fn reassemble(
 /// proof-bound at every depth.
 pub fn verify_root(
     vk: &TowerVk,
-    statement: &ChainStatement,
+    statement: &AppStatement,
     bundle: &RootBundle<'_>,
 ) -> Result<(), TowerVerifyError> {
     // (1) geometry: the depth this statement claims, and which of the two
     // node shapes roots it (k = 2 is the base's; k >= 3 the steady's).
+    // No separate "wrong workload" check: `AppStatement` is kind-erased,
+    // so a same-shape statement from the wrong workload just fails the
+    // word-for-word statement leg inside `discharge_with` below.
     let per_pair = 2 * vk.blocks_per_leaf;
-    if statement.n_blocks == 0 || !statement.n_blocks.is_multiple_of(per_pair) {
+    let count = statement.count;
+    if count == 0 || !count.is_multiple_of(per_pair) {
         return Err(TowerVerifyError::Geometry);
     }
-    let k = statement.n_blocks / per_pair;
+    let k = count / per_pair;
     if k < 2 {
         return Err(TowerVerifyError::Geometry);
     }
@@ -325,9 +346,12 @@ pub fn verify_root(
 /// over the carried statement. Returns the statement — it traveled in
 /// the payload, and every word of it (the count included, via the span
 /// counter) was re-checked against the proof.
-pub fn verify_root_bytes(vk: &TowerVk, bytes: &[u8]) -> Result<ChainStatement, TowerVerifyError> {
+pub fn verify_root_bytes(vk: &TowerVk, bytes: &[u8]) -> Result<AppStatement, TowerVerifyError> {
     let b = TowerRootBundle::from_bytes(bytes).map_err(TowerVerifyError::Encoding)?;
-    if b.config != vk.tower.cfg || b.blocks_per_leaf != vk.blocks_per_leaf as u64 {
+    if b.config != vk.tower.cfg
+        || b.blocks_per_leaf != vk.blocks_per_leaf as u64
+        || b.depth != vk.tower.depth.map_or(0, |d| d as u64)
+    {
         return Err(TowerVerifyError::VkMismatch);
     }
     verify_root(
@@ -369,11 +393,11 @@ impl TowerVk {
         TowerVkFingerprint {
             config: t.cfg,
             blocks_per_leaf: self.blocks_per_leaf,
-            chain_circuit: t.chain.inner.built.shape.circuit.digest(),
+            chain_circuit: t.chain.inner().built.shape.circuit.digest(),
             fl_circuit: t.fl.lo.shape.circuit.digest(),
             base_circuit: base_lo.shape.circuit.digest(),
             steady_circuit: t.root.lo.shape.circuit.digest(),
-            chain_registry: t.chain.inner.built.shape.registry.digest(),
+            chain_registry: t.chain.inner().built.shape.registry.digest(),
             outer_registry: t.root.lo.shape.registry.digest(),
             publics_len: t.root.lo.public.len(),
         }

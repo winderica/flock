@@ -222,13 +222,24 @@ struct ChainOpenParse<'p> {
 }
 
 impl<'p> ChildTape<'p> {
+    /// The chain child's tape: its one boolean type is BLAKE3.
     pub(super) fn new(inner: &'p MixedInner, domain: &'static [u8]) -> Self {
+        let blake_r1cs = build_block_r1cs(inner.nu);
+        Self::new_with_lincheck(inner, domain, blake_r1cs.csc_lincheck_circuit())
+    }
+
+    /// A child's tape over ITS boolean type's lincheck circuit — the walker
+    /// is otherwise type-blind (it follows the recorded transcript), so a
+    /// leaf of any single boolean table type records through here.
+    pub(super) fn new_with_lincheck(
+        inner: &'p MixedInner,
+        domain: &'static [u8],
+        lc: &dyn LincheckCircuit,
+    ) -> Self {
         let built = &inner.built;
         let proof = &inner.proof;
         let union = UnionInstance::new(&built.shape.registry, built.shape.counts.clone());
-        let blake_r1cs = build_block_r1cs(inner.nu);
-        let blake_lc = blake_r1cs.csc_lincheck_circuit();
-        let lcs: Vec<&dyn LincheckCircuit> = vec![blake_lc];
+        let lcs: Vec<&dyn LincheckCircuit> = vec![lc];
         let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(domain));
         let all_claims = match proof {
             MixedProof::Rs(p) => verify_ligerito_union_circuit(
