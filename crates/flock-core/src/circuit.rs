@@ -996,7 +996,9 @@ impl<'a> CircuitStructureMatrix<'a> {
         self.base_cols
     }
 
-    #[inline]
+    /// One entry of the table, by definition — the oracle the structured
+    /// marginals are tested against.
+    #[cfg(test)]
     fn entry(&self, row: usize, col: usize) -> F128 {
         let base_cols = self.base_cols();
         let plane = col / base_cols;
@@ -1055,32 +1057,159 @@ impl<'a> CircuitStructureMatrix<'a> {
     }
 }
 
-impl FoldMatrix for CircuitStructureMatrix<'_> {
-    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
-        assert_eq!(n_rows, self.n_rows());
-        assert_eq!(w.len(), self.n_cols());
-        let mut out = vec![F128::ZERO; n_rows];
-        for (c, &wc) in w.iter().enumerate() {
-            if wc.is_zero() {
-                continue;
-            }
-            for (r, dst) in out.iter_mut().enumerate() {
-                *dst += wc * self.entry(r, c);
+impl CircuitStructureMatrix<'_> {
+    /// The element planes' column constants: `(slot, a_const, b_const)` for
+    /// every slot an element type owns, FIRST type wins on overlap — the
+    /// same resolution [`Self::entry`]'s linear search makes.
+    fn element_cols(&self) -> Vec<(usize, F128, F128)> {
+        let registry = self.circuit.registry();
+        let nb = registry.num_boolean();
+        if registry.num_element() == 0 {
+            return Vec::new();
+        }
+        let base_cols = self.base_cols();
+        let base_word = registry.element_base() >> 7;
+        let mut taken = vec![false; base_cols];
+        let mut out = Vec::new();
+        for (ty, layout) in registry.types()[nb..].iter().zip(&registry.slots()[nb..]) {
+            let et = ty.element_type().expect("element registry suffix");
+            let kappa = ty.k_log - 7;
+            let offset = ((layout.offset >> 7) - base_word) >> registry.nu();
+            for y in 0..1usize << kappa {
+                let slot = offset + y;
+                if slot < base_cols && !taken[slot] {
+                    taken[slot] = true;
+                    out.push((slot, et.a_const()[y], et.b_const()[y]));
+                }
             }
         }
         out
     }
 
+    /// The boolean pin plane: `(slot, live_rows)` for every pinned boolean
+    /// type — the plane is `1` on rows `[0, live_rows)` of that slot.
+    fn pin_cols(&self, n_rows: usize) -> Vec<(usize, usize)> {
+        let registry = self.circuit.registry();
+        registry.boolean_types()[..registry.num_boolean().min(self.base_cols())]
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| ty.const_pin.is_some())
+            .map(|(slot, _)| (slot, self.circuit.counts()[slot].min(n_rows)))
+            .collect()
+    }
+}
+
+/// The two marginals exploit the table's structure instead of walking every
+/// `(row, column)` entry:
+///
+/// - the three cell planes are nonzero only on LIVE cells, and liveness is a
+///   per-slot row PREFIX (`row < counts[slot]`), so one pass over the live
+///   cells covers all three;
+/// - the element planes are ROW-INDEPENDENT (`a_const[y]` / `b_const[y]`);
+/// - the pin plane is `1` on a row prefix of each pinned boolean slot.
+///
+/// Field addition is XOR, so the reordered sums are bit-identical to the
+/// entry-wise definition ([`Self::entry`], kept as the test oracle).
+impl FoldMatrix for CircuitStructureMatrix<'_> {
+    fn row_marginal(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        assert_eq!(n_rows, self.n_rows());
+        assert_eq!(w.len(), self.n_cols());
+        let base = self.base_cols();
+        let nu = self.circuit.cells().nu();
+        let cell_cols = 1usize << (self.circuit.cells().mu() - nu);
+        let sigma = self.circuit.sigma();
+        let wid = &w[SigmaAssertion::MASKED_ID_PLANE * base..][..base];
+        let wlive = &w[SigmaAssertion::LIVE_PLANE * base..][..base];
+        let wsig = &w[SigmaAssertion::SIGMA_PLANE * base..][..base];
+        // Row-independent: every element column contributes to every row.
+        let wa = &w[SigmaAssertion::ELEMENT_A_PLANE * base..][..base];
+        let wb = &w[SigmaAssertion::ELEMENT_B_PLANE * base..][..base];
+        let el_const = self
+            .element_cols()
+            .iter()
+            .fold(F128::ZERO, |acc, &(slot, a, b)| {
+                acc + wa[slot] * a + wb[slot] * b
+            });
+        let pins = self.pin_cols(n_rows);
+        let wpin = &w[SigmaAssertion::BOOLEAN_PIN_PLANE * base..][..base];
+        let live_slots: Vec<(usize, usize)> = (0..cell_cols.min(base))
+            .map(|s| (s, self.mask.counts[s].min(n_rows)))
+            .filter(|&(s, n)| {
+                n > 0 && !(wid[s].is_zero() && wlive[s].is_zero() && wsig[s].is_zero())
+            })
+            .collect();
+        let mut out = vec![F128::ZERO; n_rows];
+        out.par_chunks_mut(1 << 10)
+            .enumerate()
+            .for_each(|(ci, chunk)| {
+                let r0 = ci << 10;
+                for (i, dst) in chunk.iter_mut().enumerate() {
+                    let r = r0 + i;
+                    let mut acc = el_const;
+                    for &(s, n) in &live_slots {
+                        if r < n {
+                            let x = (s << nu) | r;
+                            acc += wid[s] * F128::new(x as u64, 0)
+                                + wlive[s]
+                                + wsig[s] * F128::new(sigma[x] as u64, 0);
+                        }
+                    }
+                    for &(slot, n) in &pins {
+                        if r < n {
+                            acc += wpin[slot];
+                        }
+                    }
+                    *dst = acc;
+                }
+            });
+        out
+    }
+
     fn col_marginal(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        use rayon::prelude::IntoParallelIterator;
         assert_eq!(w.len(), self.n_rows());
         assert_eq!(n_cols, self.n_cols());
-        (0..n_cols)
-            .map(|c| {
-                w.iter()
-                    .enumerate()
-                    .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+        let n_rows = w.len();
+        let base = self.base_cols();
+        let nu = self.circuit.cells().nu();
+        let cell_cols = 1usize << (self.circuit.cells().mu() - nu);
+        let sigma = self.circuit.sigma();
+        let mut out = vec![F128::ZERO; n_cols];
+        // The three cell planes, one pass over each slot's live prefix.
+        let sums: Vec<(F128, F128, F128)> = (0..cell_cols.min(base))
+            .into_par_iter()
+            .map(|s| {
+                let n = self.mask.counts[s].min(n_rows);
+                let (mut id, mut live, mut sg) = (F128::ZERO, F128::ZERO, F128::ZERO);
+                for (r, &wr) in w[..n].iter().enumerate() {
+                    if wr.is_zero() {
+                        continue;
+                    }
+                    let x = (s << nu) | r;
+                    id += wr * F128::new(x as u64, 0);
+                    live += wr;
+                    sg += wr * F128::new(sigma[x] as u64, 0);
+                }
+                (id, live, sg)
             })
-            .collect()
+            .collect();
+        for (s, (id, live, sg)) in sums.into_iter().enumerate() {
+            out[SigmaAssertion::MASKED_ID_PLANE * base + s] = id;
+            out[SigmaAssertion::LIVE_PLANE * base + s] = live;
+            out[SigmaAssertion::SIGMA_PLANE * base + s] = sg;
+        }
+        // Row-independent element columns: constant · Σ_r w[r].
+        let wsum = w.iter().fold(F128::ZERO, |a, &x| a + x);
+        for (slot, a, b) in self.element_cols() {
+            out[SigmaAssertion::ELEMENT_A_PLANE * base + slot] = a * wsum;
+            out[SigmaAssertion::ELEMENT_B_PLANE * base + slot] = b * wsum;
+        }
+        // Pin columns: the weight over each pinned slot's live prefix.
+        for (slot, n) in self.pin_cols(n_rows) {
+            out[SigmaAssertion::BOOLEAN_PIN_PLANE * base + slot] =
+                w[..n].iter().fold(F128::ZERO, |a, &x| a + x);
+        }
+        out
     }
 
     fn n_rows(&self) -> usize {
@@ -1089,6 +1218,29 @@ impl FoldMatrix for CircuitStructureMatrix<'_> {
 
     fn n_cols(&self) -> usize {
         8 * self.base_cols()
+    }
+}
+
+#[cfg(test)]
+impl CircuitStructureMatrix<'_> {
+    /// The entry-wise definitions — the differential oracle.
+    fn row_marginal_naive(&self, w: &[F128], n_rows: usize) -> Vec<F128> {
+        let mut out = vec![F128::ZERO; n_rows];
+        for (c, &wc) in w.iter().enumerate() {
+            for (r, dst) in out.iter_mut().enumerate() {
+                *dst += wc * self.entry(r, c);
+            }
+        }
+        out
+    }
+    fn col_marginal_naive(&self, w: &[F128], n_cols: usize) -> Vec<F128> {
+        (0..n_cols)
+            .map(|c| {
+                w.iter()
+                    .enumerate()
+                    .fold(F128::ZERO, |acc, (r, &wr)| acc + wr * self.entry(r, c))
+            })
+            .collect()
     }
 }
 
@@ -1685,6 +1837,75 @@ mod tests {
     /// the accumulator's form), a tampered assertion value fails the
     /// discharge, and a naively tampered claimed `s_sigma_eval` is caught
     /// by the GKR's own input check.
+    /// The structured marginals of the circuit-structure table equal the
+    /// entry-wise definitions exactly — over a mixed registry (cell, element
+    /// and, with a pinned boolean type, pin planes all live), at partial
+    /// counts (so the live-prefix mask bites), for random weights.
+    #[test]
+    fn structure_matrix_marginals_match_entrywise() {
+        for (nu, pin) in [(3usize, false), (3, true), (4, true)] {
+            let mut reg_types = vec![
+                bool_ty(
+                    12,
+                    3000,
+                    vec![IoWord::input(0), IoWord::input(5), IoWord::output(2)],
+                ),
+                mult_ty(
+                    3,
+                    vec![IoWord::input(0), IoWord::input(1), IoWord::output(2)],
+                ),
+                mult_ty(2, vec![IoWord::input(1), IoWord::output(2)]),
+            ];
+            if pin {
+                reg_types[0].const_pin = Some(7);
+            }
+            let reg = Registry::new(reg_types, nu);
+            let full = 1usize << nu;
+            let counts = vec![full - 3, full - 4, full - 2];
+            let circuit = Circuit::new(
+                &reg,
+                counts,
+                9,
+                vec![
+                    vec![Cell::new(2, 0), Cell::new(0, 1), Cell::new(3, 2)],
+                    vec![
+                        Cell::new(2, 1),
+                        Cell::new(4, 3),
+                        Cell::new(6, 0),
+                        Cell::new(8, 4),
+                    ],
+                    vec![Cell::new(5, 1), Cell::new(1, 2)],
+                ],
+            )
+            .expect("valid circuit");
+            use crate::matrix_fold::FoldMatrix as _;
+            let m = SigmaAssertion::matrix(&circuit);
+            let (nr, nc) = (m.n_rows(), m.n_cols());
+            let mut rng = Rng::new(0x5171_0000 + nu as u64 + pin as u64);
+            for _ in 0..3 {
+                let wr: Vec<F128> = (0..nr).map(|_| rng.f128()).collect();
+                let wc: Vec<F128> = (0..nc).map(|_| rng.f128()).collect();
+                assert_eq!(
+                    m.col_marginal(&wr, nc),
+                    m.col_marginal_naive(&wr, nc),
+                    "col marginal (nu {nu}, pin {pin})"
+                );
+                assert_eq!(
+                    m.row_marginal(&wc, nr),
+                    m.row_marginal_naive(&wc, nr),
+                    "row marginal (nu {nu}, pin {pin})"
+                );
+            }
+            // Sparse weights: the zero-skips must not change anything.
+            let mut wr = vec![F128::ZERO; nr];
+            wr[1] = rng.f128();
+            let mut wc = vec![F128::ZERO; nc];
+            wc[nc / 3] = rng.f128();
+            assert_eq!(m.col_marginal(&wr, nc), m.col_marginal_naive(&wr, nc));
+            assert_eq!(m.row_marginal(&wc, nr), m.row_marginal_naive(&wc, nr));
+        }
+    }
+
     #[test]
     fn wiring_sigma_deferral() {
         let nu = 3;

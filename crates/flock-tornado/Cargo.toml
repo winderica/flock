@@ -1,0 +1,19 @@
+[package]
+name = "flock-tornado"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A post-quantum Tornado Cash withdrawal batch as a Flock recursion-tower workload."
+
+[dependencies]
+flock-prover = { path = "../flock-prover" }
+flock-core = { path = "../flock-core" }
+flock-field = { workspace = true }
+flock-merkle = { workspace = true }
+serde = { workspace = true }
+rayon = { workspace = true }
+bincode = { workspace = true }
+
+[lints]
+workspace = true

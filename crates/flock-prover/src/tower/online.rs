@@ -260,3 +260,102 @@ pub(super) fn report_stage(name: &str, runs: &[Online]) {
         );
     }
 }
+
+/// `TOWER_SETUP_TRACE=1` phase timer for the per-shape setup of a fold
+/// node: prints the elapsed time since the last mark and resets it.
+pub(super) fn setup_mark(label: &str, t: &mut std::time::Instant) {
+    if std::env::var_os("TOWER_SETUP_TRACE").is_some() {
+        eprintln!(
+            "    [setup] {label:<34} {:8.1} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    *t = std::time::Instant::now();
+}
+
+/// A finished outer shape and its compiled fill plan, possibly from the
+/// cache — `hit` says the plan was already pinned against the generic walk
+/// when the entry was first built.
+pub(super) struct Finished {
+    pub(super) shape: std::sync::Arc<flock_core::circuit::builder::CircuitShape>,
+    pub(super) plan: std::sync::Arc<flock_core::circuit::builder::FillPlan>,
+    pub(super) hit: bool,
+}
+
+/// **The outer-shape cache.** A fold node's circuit is a pure function of
+/// its builder's structure, and every first-level node over same-shaped
+/// leaves — like every steady spine node — emits the same structure with
+/// different values. [`ShapeBuilder::finish`] (the wiring permutation, the
+/// registry digest over every table's matrices) plus the fill-plan compile
+/// is the expensive, value-independent half of setup, so it is done once per
+/// distinct [`ShapeBuilder::fingerprint`] and reused.
+///
+/// `TOWER_NO_SHAPE_CACHE=1` disables the cache (every call finishes afresh),
+/// for A/B timing.
+///
+/// [`ShapeBuilder::finish`]: flock_core::circuit::builder::ShapeBuilder::finish
+/// [`ShapeBuilder::fingerprint`]: flock_core::circuit::builder::ShapeBuilder::fingerprint
+pub(super) fn finish_cached(sb: flock_core::circuit::builder::ShapeBuilder) -> Finished {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use flock_core::circuit::builder::{CircuitShape, FillPlan};
+    type Entry = ([u8; 32], Arc<CircuitShape>, Arc<FillPlan>);
+    // A tower has at most three outer shapes (FL, base, steady); a few more
+    // slots cover a process that builds towers at several geometries.
+    const CAP: usize = 8;
+    static CACHE: OnceLock<Mutex<Vec<Entry>>> = OnceLock::new();
+
+    let finish = |sb: flock_core::circuit::builder::ShapeBuilder| {
+        let shape = sb.finish().expect("the outer circuit builds");
+        let plan = shape.fill_plan();
+        (Arc::new(shape), Arc::new(plan))
+    };
+    if std::env::var_os("TOWER_NO_SHAPE_CACHE").is_some() {
+        let (shape, plan) = finish(sb);
+        return Finished {
+            shape,
+            plan,
+            hit: false,
+        };
+    }
+    let key = sb.fingerprint();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Some((_, shape, plan)) = cache.lock().unwrap().iter().find(|(k, _, _)| *k == key) {
+        return Finished {
+            shape: shape.clone(),
+            plan: plan.clone(),
+            hit: true,
+        };
+    }
+    let (shape, plan) = finish(sb);
+    let mut g = cache.lock().unwrap();
+    if g.len() == CAP {
+        g.remove(0);
+    }
+    g.push((key, shape.clone(), plan.clone()));
+    Finished {
+        shape,
+        plan,
+        hit: false,
+    }
+}
+
+/// Whether the tower builders run their **native self-checks** — the
+/// prover re-checking its own work, none of which a verifier relies on:
+///
+/// - every child region's checker walk against its native replicas;
+/// - discharging each fold's accumulator against the native tables, both
+///   right after the fold and again as reassembled from the published
+///   segment (the root's job — the recursion exists to DEFER it);
+/// - recomputing a chain span natively;
+/// - verifying the outer proof the builder just produced, full and deferred.
+///
+/// Soundness rests on the root verifier ([`crate::tower::verify_root`]),
+/// which runs all of the deferred checks once. These are debugging
+/// oracles: ON in this crate's own tests, otherwise opt-in with
+/// `TOWER_SELF_CHECK=1`. Assertions that cost nothing (equalities between
+/// values already in hand) stay unconditional.
+pub fn self_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cfg!(test) || std::env::var_os("TOWER_SELF_CHECK").is_some())
+}

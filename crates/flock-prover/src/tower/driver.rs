@@ -208,6 +208,10 @@ pub struct TowerCosts {
     pub nodes: usize,
     pub node_online_ms: f64,
     pub node_setup_ms: f64,
+    /// Wall clock of every FL / node builder call, end to end — everything
+    /// the builders do, whichever bucket their own timers put it in.
+    pub fl_wall_ms: f64,
+    pub node_wall_ms: f64,
 }
 
 impl TowerCosts {
@@ -298,7 +302,9 @@ impl Tower {
                 costs.leaf_setup_ms += l.online().setup_ms;
             }
             let kids: [&dyn TowerLeaf; 2] = [&l0, &l1];
+            let t_fl = std::time::Instant::now();
             fls.push(build_first_level_node_kids(cfg, &kids));
+            costs.fl_wall_ms += t_fl.elapsed().as_secs_f64() * 1e3;
             // Leaf 0 survives as the lane's material owner (one shape for
             // every leaf); every other leaf drops here.
             owner.get_or_insert(l0);
@@ -352,6 +358,8 @@ impl Tower {
         // ---- THE BASE: fresh-only over the LAST two FLs (the spine
         // grows by prepending, so the base covers the chain's tail) ----
         let k = fls.len();
+        let mut node_wall_ms = 0.0f64;
+        let t_node = std::time::Instant::now();
         let base = build_node_outer_app_kind(
             cfg,
             &[&fls[k - 2].lo, &fls[k - 1].lo],
@@ -368,6 +376,7 @@ impl Tower {
             }),
             None,
         );
+        node_wall_ms += t_node.elapsed().as_secs_f64() * 1e3;
         note_node(&base);
 
         // ---- THE SPINE: prepend the next-earlier FL, level by level ----
@@ -378,6 +387,7 @@ impl Tower {
             for i in (0..k - 2).rev() {
                 let prev = cur.as_ref().unwrap_or(&base);
                 let prev_lane = prev.lane_acc.clone().expect("the lane rides every level");
+                let t_node = std::time::Instant::now();
                 let n = build_node_outer_app_kind(
                     cfg,
                     &[&fls[i].lo, &prev.lo],
@@ -398,6 +408,7 @@ impl Tower {
                         forge: false,
                     }),
                 );
+                node_wall_ms += t_node.elapsed().as_secs_f64() * 1e3;
                 // ONE steady shape: from the second spine fold on, the
                 // digest must not move (wall 3's convergence).
                 if let Some(c) = &cur {
@@ -416,6 +427,7 @@ impl Tower {
             )
         };
 
+        costs.node_wall_ms += node_wall_ms;
         let fl = fls.into_iter().next().expect("FL 0");
         Tower {
             cfg,

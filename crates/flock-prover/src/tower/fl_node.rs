@@ -260,6 +260,7 @@ pub fn build_first_level_node_k(cfg: TowerConfig, cps: &[&ChainProof]) -> FlNode
 /// third child.
 pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) -> FlNode {
     const FL_DOMAIN: &[u8] = b"flock-chain-fl-node-v0";
+    let mut tm = Instant::now();
 
     let k_ary = kids.len();
     assert_eq!(
@@ -352,16 +353,18 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
     .expect("the first-level fold verifies");
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
     assert!(acc_v.per_element.is_empty(), "no element group accumulated");
-    assert!(acc_v.discharge(&mats), "the boolean group discharges");
-    assert!(
-        acc_v.discharge_sigma(&[&cp0.built.shape.circuit]),
-        "the sigma group discharges against the ONE chain circuit"
-    );
     assert_eq!(acc_v.jagged.len(), 1, "one jagged key: the chain layout");
-    assert!(
-        acc_v.discharge_jagged(&[(chain_digest, &chain_params_j)]),
-        "the folded jagged entry discharges against the chain layout"
-    );
+    if crate::tower::online::self_check() {
+        assert!(acc_v.discharge(&mats), "the boolean group discharges");
+        assert!(
+            acc_v.discharge_sigma(&[&cp0.built.shape.circuit]),
+            "the sigma group discharges against the ONE chain circuit"
+        );
+        assert!(
+            acc_v.discharge_jagged(&[(chain_digest, &chain_params_j)]),
+            "the folded jagged entry discharges against the chain layout"
+        );
+    }
 
     // The three folds' claim lists — no priors, so [fresh; k] each.
     let n_priors = 0usize;
@@ -409,6 +412,7 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
     );
     assert_eq!(rec.payloads()[1], vec![0u8], "bind: prior count 0");
     let (locs, vcur, ccur) = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    crate::tower::online::setup_mark("FL: native fold + tape pin", &mut tm);
     let jfps: Vec<&FoldProof> = agg.jagged_folds.iter().collect();
     let jlocs = locate_and_pin_jagged_folds(
         &jagged_keys,
@@ -441,6 +445,7 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
         .iter()
         .map(|inner| ChildTape::new_with_lincheck(inner, DOMAIN, blake_lc))
         .collect();
+    crate::tower::online::setup_mark("FL: child tapes (ChildTape::new)", &mut tm);
     assert!(tapes.iter().all(|t| t.el.is_none()), "chain children");
 
     // ---- the outer: k chain-tape regions + the fold region + adjacency ----
@@ -494,6 +499,7 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
         );
         let nu2 = env.nu;
         let t_build = Instant::now();
+        crate::tower::online::setup_mark("FL: merge_chain + envelope", &mut tm);
         let mut sb = ShapeBuilder::new(nu2);
         let spread_own2 = tapes.iter().map(|t| t.spread_w).max().expect("children");
         assert!(
@@ -1028,7 +1034,22 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
             );
             env_app_base(&env)
         };
-        let shape2 = sb.finish().expect("the first-level node circuit builds");
+        crate::tower::online::setup_mark("FL: emission (gates/wires/vals)", &mut tm);
+        // The value-independent half — finish + fill-plan compile — comes from
+        // the outer-shape cache when this FL's structure has been built before.
+        let crate::tower::online::Finished {
+            shape: shape2,
+            plan: fill_plan,
+            hit: shape_hit,
+        } = crate::tower::online::finish_cached(sb);
+        crate::tower::online::setup_mark(
+            if shape_hit {
+                "FL: shape (cache hit)"
+            } else {
+                "FL: finish + fill_plan (miss)"
+            },
+            &mut tm,
+        );
         let hint_refs: Vec<&(dyn Any + Sync)> =
             hints.iter().map(|h| h as &(dyn Any + Sync)).collect();
         // THE INDEX-FILL RUNNER (setup), the node's path: compile the plan,
@@ -1036,8 +1057,9 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
         // online run trusts it. run() stays the differential oracle — this
         // pin is what keeps it one, now that the FL no longer walks in the
         // timed path either.
-        let fill_plan = shape2.fill_plan();
-        {
+        // The plan is pinned row-identical to the generic walk once, when the
+        // shape is first built; a cached shape carries an already-pinned plan.
+        if !shape_hit {
             let walk = shape2.run(&vals, &hint_refs);
             let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);
             assert_eq!(walk.public, fill.public, "fill plan: public segment");
@@ -1076,6 +1098,7 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
                 "fill plan: family-H rows"
             );
         }
+        crate::tower::online::setup_mark("FL: fill-plan pin (run vs run_filled)", &mut tm);
         let build_ms = t_build.elapsed().as_secs_f64() * 1e3;
         // Per-SHAPE prover materials, hoisted above the online loop — BLAKE3
         // for BOTH the Merkle trees and the FS chain, so the node is
@@ -1101,6 +1124,7 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
         let family_slot = cs.q.family.expect("family-H slot");
         let family_r1cs2 = FamilyTransposeTileTable::build_block_r1cs(nu2);
         let family_lc2 = family_r1cs2.csc_lincheck_circuit();
+        crate::tower::online::setup_mark("FL: outer r1cs + CSC tables", &mut tm);
         // The FL's own native app statement — the children's app words,
         // composed per kind — computed once, checked against the
         // published block every online iteration and stored as the node's
@@ -1125,18 +1149,21 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
             // packed, and the assembly below feeds the prover from the rows.
             let mut built2 = shape2.run_filled_deferred(&fill_plan, &vals, &hint_refs);
             let run_ms = t_run.elapsed().as_secs_f64() * 1e3;
+            let mut t_chk = Instant::now();
 
             // Child checkers (each child's whole deferred-verifier statement
             // against its own native replicas), then the fold checker + the
             // accumulator reassembled from publics, then the app statement.
-            let mut region_end = 0usize;
-            for (tk, rk) in tapes.iter().zip(&regions) {
-                let consumed = check_child_region(&built2.public, tk, rk);
-                assert!(
-                    region_end <= rk.pub_base && rk.pub_base + consumed <= fold_pub_base,
-                    "the regions' public blocks are disjoint and ordered"
-                );
-                region_end = rk.pub_base + consumed;
+            if crate::tower::online::self_check() {
+                let mut region_end = 0usize;
+                for (tk, rk) in tapes.iter().zip(&regions) {
+                    let consumed = check_child_region(&built2.public, tk, rk);
+                    assert!(
+                        region_end <= rk.pub_base && rk.pub_base + consumed <= fold_pub_base,
+                        "the regions' public blocks are disjoint and ordered"
+                    );
+                    region_end = rk.pub_base + consumed;
+                }
             }
             // ACC_CHAIN keeps the un-keyed entry layout: the lane's registry
             // role has ONE key (the chain circuit), so nothing to disambiguate.
@@ -1169,12 +1196,14 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
                 acc_pub, acc_v,
                 "the Accumulator, reassembled from the public segment alone"
             );
-            assert!(
-                acc_pub.discharge(&mats)
-                    && acc_pub.discharge_sigma(&[&cp0.built.shape.circuit])
-                    && acc_pub.discharge_jagged(&[(chain_digest, &chain_params_j)]),
-                "the public-segment accumulator discharges all three groups"
-            );
+            if crate::tower::online::self_check() {
+                assert!(
+                    acc_pub.discharge(&mats)
+                        && acc_pub.discharge_sigma(&[&cp0.built.shape.circuit])
+                        && acc_pub.discharge_jagged(&[(chain_digest, &chain_params_j)]),
+                    "the public-segment accumulator discharges all three groups"
+                );
+            }
             if let Some((lam_base, _, _, _)) = &rs_lam {
                 for (i, &v) in PHI_8_TABLE[..1 << K_SKIP].iter().enumerate() {
                     assert_eq!(built2.public[*lam_base + i], v, "λ const {i}");
@@ -1203,7 +1232,7 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
                     "node statement word {j}"
                 );
             }
-            if let AppKind::Chain = kind {
+            if crate::tower::online::self_check() && kind == AppKind::Chain {
                 let decode = |w: [F128; 8], base: usize| -> [u32; 16] {
                     let mut out = [0u32; 16];
                     for j in 0..4 {
@@ -1230,6 +1259,7 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
             // Recreated per online iteration — the spread closure consumes it.
             let spread_ty2 = BitSpreadTable::new(spread_w2);
             let pow_ty2 = PowMaskTable;
+            crate::tower::online::setup_mark("FL online: native checkers", &mut t_chk);
             let t_asm = Instant::now();
             // THE COPY-FREE ASSEMBLY, the node's path: the boolean drivers pack
             // straight into the union's slot blocks inside the prove (live rows
@@ -1354,18 +1384,20 @@ pub fn build_first_level_node_kids(cfg: TowerConfig, kids: &[&dyn TowerLeaf]) ->
             };
             let prove_ms = t_prove.elapsed().as_secs_f64() * 1e3;
             let t_ver = Instant::now();
-            let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-            oproof
-                .verify_circuit(
-                    &union2,
-                    &shape2.circuit,
-                    &built2.public,
-                    &lcs2,
-                    &ocommit,
-                    &pcs2,
-                    &mut ch2,
-                )
-                .expect("the first-level node verifies over the circuit path");
+            if crate::tower::online::self_check() {
+                let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
+                oproof
+                    .verify_circuit(
+                        &union2,
+                        &shape2.circuit,
+                        &built2.public,
+                        &lcs2,
+                        &ocommit,
+                        &pcs2,
+                        &mut ch2,
+                    )
+                    .expect("the first-level node verifies over the circuit path");
+            }
             let verify_ms2 = t_ver.elapsed().as_secs_f64() * 1e3;
             onlines.push(Online {
                 setup_ms: build_ms,

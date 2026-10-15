@@ -1255,7 +1255,9 @@ pub(super) fn emit_opening(
 /// the BLAKE3/BLAKE3 circuit proof, and the boolean tables whose lincheck
 /// circuits a verifier needs (in registry order via the `*_slot` indices).
 pub struct LeafOuter {
-    pub(super) shape: CircuitShape,
+    /// Shared: every outer built from one cached shape points at the same
+    /// circuit (see [`crate::tower::online::finish_cached`]).
+    pub(super) shape: std::sync::Arc<CircuitShape>,
     /// `pub`, along with `proof` and `pcs`: a workload's own reference
     /// tower reads its FL/node outers' publics/proof/pcs straight off
     /// this — see the leaf extension surface's own first-level-node test,

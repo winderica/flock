@@ -235,6 +235,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "flock-tornado"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "flock-core",
+ "flock-field",
+ "flock-merkle",
+ "flock-prover",
+ "rayon",
+ "serde",
+]
+
+[[package]]
 name = "flock-transcript"
 version = "0.1.0"
 dependencies = [

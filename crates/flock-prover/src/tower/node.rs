@@ -411,11 +411,13 @@ pub fn build_node_outer_app_kind(
         .iter()
         .map(|lo| outer_union(&lo.shape.registry, lo.shape.counts.clone()))
         .collect();
+    let mut tm = Instant::now();
     let t_tapes = Instant::now();
     // The children's tapes are independent statement work — build them
     // concurrently (each is a recording verify + the region pins).
     let rts: Vec<RealTape> = { los.par_iter().map(|lo| RealTape::new(lo, DOMAIN)).collect() };
     let tape_setup_ms = t_tapes.elapsed().as_secs_f64() * 1e3;
+    crate::tower::online::setup_mark("NODE: child tapes (RealTape::new, par)", &mut tm);
     for i in 1..n_kids {
         assert_ne!(
             rts[0].sigma_native.rho, rts[i].sigma_native.rho,
@@ -530,6 +532,7 @@ pub fn build_node_outer_app_kind(
             jagged: norm(&p.jagged),
         }
     });
+    crate::tower::online::setup_mark("NODE:   pre-fold gather", &mut tm);
     let priors: Vec<&Accumulator> = prior_acc.iter().collect();
     let mut chp = FsChallenger::with_chained_blake3(M11_NODE_DOMAIN);
     let (agg, acc_p) = prove_aggregate_classes_with_grinding(
@@ -546,6 +549,7 @@ pub fn build_node_outer_app_kind(
         &mut chp,
     )
     .expect("the node fold proves");
+    crate::tower::online::setup_mark("NODE:   prove_aggregate (fold PROVER)", &mut tm);
     let mut rec = RecordingChallenger::new(FsChallenger::with_chained_blake3(M11_NODE_DOMAIN));
     let acc_v = verify_aggregate_classes_with_grinding(
         registry,
@@ -559,24 +563,34 @@ pub fn build_node_outer_app_kind(
         &mut rec,
     )
     .expect("the node fold verifies");
+    crate::tower::online::setup_mark("NODE:   verify_aggregate (recorded)", &mut tm);
     assert_eq!(acc_p, acc_v, "prover and verifier accumulators agree");
-    assert!(acc_v.discharge(&mats), "the boolean group discharges");
+    let self_check = crate::tower::online::self_check();
     assert!(
-        acc_v.discharge_element(&el_mats),
+        !self_check || acc_v.discharge(&mats),
+        "the boolean group discharges"
+    );
+    crate::tower::online::setup_mark("NODE:   self-check: discharge boolean", &mut tm);
+
+    assert!(
+        !self_check || acc_v.discharge_element(&el_mats),
         "the element group discharges"
     );
+    crate::tower::online::setup_mark("NODE:   self-check: discharge element", &mut tm);
     assert!(
-        acc_v.discharge_sigma(&key_circuits),
+        !self_check || acc_v.discharge_sigma(&key_circuits),
         "the sigma group discharges"
     );
+    crate::tower::online::setup_mark("NODE:   self-check: discharge sigma", &mut tm);
     assert_eq!(acc_v.jagged.len(), n_keys, "one jagged entry per key");
     let jag_tables: Vec<([u8; 32], &JaggedParams)> = (0..n_keys)
         .map(|j| (key_digests[j], &params_j[j]))
         .collect();
     assert!(
-        acc_v.discharge_jagged(&jag_tables),
+        !self_check || acc_v.discharge_jagged(&jag_tables),
         "the folded jagged entries discharge against their children's layouts"
     );
+    crate::tower::online::setup_mark("NODE:   self-check: discharge jagged", &mut tm);
 
     // The fold groups in aggregate order, from the CHILDREN'S OWN
     // assertion data (the same constructors the verifier gathers with).
@@ -727,6 +741,7 @@ pub fn build_node_outer_app_kind(
         );
     }
     let (locs, vcur, ccur) = locate_and_pin_folds(&fold_claims, &fold_proofs, vals_rec, chals);
+    crate::tower::online::setup_mark("NODE: main native fold + pin", &mut tm);
     let jfps: Vec<&FoldProof> = agg.jagged_folds.iter().collect();
     let jlocs = locate_and_pin_jagged_folds(
         &jagged_keys,
@@ -814,7 +829,8 @@ pub fn build_node_outer_app_kind(
             "the lane carries the chain jagged key"
         );
         assert!(
-            lacc_v.discharge_jagged(&[(ln.circuit.digest(), ln.params)]),
+            !crate::tower::online::self_check()
+                || lacc_v.discharge_jagged(&[(ln.circuit.digest(), ln.params)]),
             "the lane's folded jagged entry discharges against the chain layout"
         );
         let lclaims: Vec<Vec<MatrixClaim>> = vec![
@@ -866,6 +882,7 @@ pub fn build_node_outer_app_kind(
             "lane prior count"
         );
         let (llocs, lvcur, lccur) = locate_and_pin_folds(&lclaims, &lproofs, &lvals, &lchals);
+        crate::tower::online::setup_mark("NODE: lane native fold + pin", &mut tm);
         let ljfps: Vec<&FoldProof> = lagg.jagged_folds.iter().collect();
         let ljlocs = locate_and_pin_jagged_folds(
             &ljagged_keys,
@@ -918,6 +935,7 @@ pub fn build_node_outer_app_kind(
         assert_chain_replays(&ops, &trace, chals);
 
         let env = envelope_shape();
+        crate::tower::online::setup_mark("NODE: merge_chain etc", &mut tm);
         let split_b3 = n_kids == 2;
         let (fold_b3_primary_rows, b3_rows) = if split_b3 {
             let a = rts[0].b3_rows;
@@ -2084,6 +2102,7 @@ pub fn build_node_outer_app_kind(
             );
         }
         let build_ms = t_tapes.elapsed().as_secs_f64() * 1e3 - tape_setup_ms;
+        crate::tower::online::setup_mark("NODE: emission (gates/wires/vals)", &mut tm);
         let t_build2 = Instant::now();
         // publics*: the node pads to the same public-segment length the
         // leaf does (free counts: the count VECTORS deliberately differ —
@@ -2110,7 +2129,23 @@ pub fn build_node_outer_app_kind(
             );
             app_w.as_ref().map(|_| env_app_base(&env))
         };
-        let shape2 = sb.finish().expect("the 2->1 node circuit builds");
+        crate::tower::online::setup_mark("NODE: envelope padding", &mut tm);
+        // The value-independent half — finish + fill-plan compile — comes from
+        // the outer-shape cache when this node's structure has been built
+        // before (every steady spine node after the first).
+        let crate::tower::online::Finished {
+            shape: shape2,
+            plan: fill_plan,
+            hit: shape_hit,
+        } = crate::tower::online::finish_cached(sb);
+        crate::tower::online::setup_mark(
+            if shape_hit {
+                "NODE: shape (cache hit)"
+            } else {
+                "NODE: finish + fill_plan (miss)"
+            },
+            &mut tm,
+        );
         // The two-limb Ligerito verifier plus the split BLAKE table stays
         // below 512 cell slots, which pins the optimized mu=23 boundary.
         assert!(
@@ -2198,10 +2233,9 @@ pub fn build_node_outer_app_kind(
         // trusts it — publics, every boolean row store, and every
         // element slot's packed witness, field for field. The walk stays the
         // differential oracle; only the plan runs in the timed loop.
-        let t_plan = Instant::now();
-        let fill_plan = shape2.fill_plan();
-        let build_ms = build_ms + t_plan.elapsed().as_secs_f64() * 1e3;
-        {
+        // The plan is pinned row-identical to the generic walk once, when the
+        // shape is first built; a cached shape carries an already-pinned plan.
+        if !shape_hit {
             let walk = shape2.run(&vals, &hint_refs);
             let fill = shape2.run_filled(&fill_plan, &vals, &hint_refs);
             assert_eq!(walk.public, fill.public, "fill plan: public segment");
@@ -2257,6 +2291,7 @@ pub fn build_node_outer_app_kind(
             // gotchas, third occurrence).
             merkle_hash: HashKind::Blake3,
         };
+        crate::tower::online::setup_mark("NODE: fill-plan pin + pcs params", &mut tm);
         let t_r1cs = Instant::now();
         let b3_r1cs2 = chain_blake_r1cs(nu2);
         let b3_lc2 = b3_r1cs2.csc_lincheck_circuit();
@@ -2270,6 +2305,7 @@ pub fn build_node_outer_app_kind(
         let family_r1cs2 = FamilyTransposeTileTable::build_block_r1cs(nu2);
         let family_lc2 = family_r1cs2.csc_lincheck_circuit();
         let build_ms = build_ms + t_r1cs.elapsed().as_secs_f64() * 1e3;
+        crate::tower::online::setup_mark("NODE: outer r1cs + CSC tables", &mut tm);
         // TOWER_STEADY=N (or the bench's STEADY_OVERRIDE) re-runs the ONLINE
         // phases (tapes + trace + asm + prove + verify) N extra times over
         // the SAME built shape: the offline setup (circuit, R1CS, PCS
@@ -2298,15 +2334,19 @@ pub fn build_node_outer_app_kind(
             // packed; the assembly below feeds the prover from the rows.
             let mut built2 = shape2.run_filled_deferred(&fill_plan, &vals, &hint_refs);
             let trace_ms = t_trace.elapsed().as_secs_f64() * 1e3;
+            let mut t_chk = Instant::now();
 
             // The two child regions' checker walks — each child's whole
             // deferred-verifier statement held against its own replicas.
-            let consumed: Vec<usize> = rts
-                .iter()
-                .zip(&regions)
-                .map(|(rt, r)| check_real_child_region(&built2.public, rt, r))
-                .collect();
-            for i in 0..n_kids {
+            let consumed: Vec<usize> = if self_check {
+                rts.iter()
+                    .zip(&regions)
+                    .map(|(rt, r)| check_real_child_region(&built2.public, rt, r))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for i in 0..consumed.len() {
                 let end = regions[i].pub_base + consumed[i];
                 let next = if i + 1 < n_kids {
                     regions[i + 1].pub_base
@@ -2408,10 +2448,11 @@ pub fn build_node_outer_app_kind(
                 "the Accumulator, reassembled from the public segment alone"
             );
             assert!(
-                acc_pub.discharge(&mats)
-                    && acc_pub.discharge_element(&el_mats)
-                    && acc_pub.discharge_sigma(&key_circuits)
-                    && acc_pub.discharge_jagged(&jag_tables),
+                !self_check
+                    || acc_pub.discharge(&mats)
+                        && acc_pub.discharge_element(&el_mats)
+                        && acc_pub.discharge_sigma(&key_circuits)
+                        && acc_pub.discharge_jagged(&jag_tables),
                 "the public-segment accumulator discharges all four groups"
             );
             // THE PASSENGER, natively: the child's own, unless this node is
@@ -2532,6 +2573,7 @@ pub fn build_node_outer_app_kind(
                 }
             }
 
+            crate::tower::online::setup_mark("NODE online: native checkers", &mut t_chk);
             let t_asm = Instant::now();
             // Recreated per online iteration — the spread closure consumes it.
             let spread_ty2 = BitSpreadTable::new(spread_w2);
@@ -2703,32 +2745,34 @@ pub fn build_node_outer_app_kind(
             let prove_ms = t0p.elapsed().as_secs_f64() * 1e3;
             let t0v = Instant::now();
             let mut ch2 = FsChallenger::with_chained_blake3(DOMAIN);
-            let vres = oproof.verify_circuit(
-                &union2,
-                &shape2.circuit,
-                &built2.public,
-                &lcs2,
-                &ocommit,
-                &pcs2,
-                &mut ch2,
-            );
+            let vres = (self_check || forge_match).then(|| {
+                oproof.verify_circuit(
+                    &union2,
+                    &shape2.circuit,
+                    &built2.public,
+                    &lcs2,
+                    &ocommit,
+                    &pcs2,
+                    &mut ch2,
+                )
+            });
             if forge_match {
                 // The forged world's rows all satisfy their relations — only
                 // the wiring product can object, and it MUST.
                 assert!(
                     matches!(
                         vres,
-                        Err(FlockVerifyError::Wiring(WiringError::Gkr(
+                        Some(Err(FlockVerifyError::Wiring(WiringError::Gkr(
                             ProductGkrError::ProductMismatch
-                        )))
+                        ))))
                     ),
                     "a forged live fold of a mismatched entry must die on the wiring product"
                 );
-            } else {
-                vres.expect("the 2->1 node verifies");
+            } else if let Some(v) = vres {
+                v.expect("the 2->1 node verifies");
             }
             let verify_ms = t0v.elapsed().as_secs_f64() * 1e3;
-            let deferred_ms = if forge_match {
+            let deferred_ms = if forge_match || !self_check {
                 0.0
             } else {
                 let t0d = Instant::now();

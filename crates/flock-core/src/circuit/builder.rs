@@ -162,6 +162,8 @@ trait SlotBuild: Any + Send + Sync {
     /// storage, so a clone would be cheap today; the move keeps the
     /// ownership story single-owner.)
     fn take_table(&mut self) -> TableType;
+    /// The table, before `finish` moves it — for [`ShapeBuilder::fingerprint`].
+    fn table_ref(&self) -> &TableType;
     fn n_in(&self) -> usize;
     fn n_out(&self) -> usize;
     /// A fresh, empty `Vec<G::Row>` for one online run.
@@ -210,6 +212,11 @@ where
     fn take_table(&mut self) -> TableType {
         self.table
             .take()
+            .expect("table already moved into the registry")
+    }
+    fn table_ref(&self) -> &TableType {
+        self.table
+            .as_ref()
             .expect("table already moved into the registry")
     }
     fn n_in(&self) -> usize {
@@ -331,6 +338,7 @@ const FILL_CHECK: u32 = 1 << 31;
 /// A maximal run of consecutive same-slot, same-hintedness steps — one
 /// monomorphic [`SlotBuild::run_batch`] call. Batches never straddle an
 /// island boundary.
+#[derive(Clone)]
 struct FillBatch {
     slot: u32,
     n: u32,
@@ -350,6 +358,7 @@ struct FillBatch {
 /// independence contract moves to compile time: an island reading (or
 /// checking against) a wire another island writes fails `fill_plan`, not the
 /// proof.
+#[derive(Clone)]
 struct FillIsland {
     /// This island's batches: `batches[range.0..range.1]`.
     batches: (u32, u32),
@@ -378,6 +387,7 @@ struct FillIsland {
 /// The plan is data about the shape, not a second semantics: `run` stays as
 /// the differential oracle, and the two produce identical
 /// [`CircuitWitness`]es — publics, rows and witnesses.
+#[derive(Clone)]
 pub struct FillPlan {
     batches: Vec<FillBatch>,
     /// Concatenated input-cell tape indices, `n_in` per gate, batch-major.
@@ -648,6 +658,116 @@ impl ShapeBuilder {
         }
         assert!(start <= end);
         self.islands.push((start, end));
+    }
+
+    /// A digest of everything [`finish`](Self::finish) reads to build the
+    /// shape: the row capacity, every slot's gate type and table metadata
+    /// (`k_log`, `useful_bits`, class, constant pin, io schema), every wire's
+    /// cells and equivalence class, the publics (and fixed public values),
+    /// the inputs, every gate step, the per-slot row counts, the hint count
+    /// and the islands. No field values — the shape is value-independent.
+    ///
+    /// Two builders with equal fingerprints produce the same
+    /// [`CircuitShape`], so a caller emitting the same circuit for a new
+    /// statement can reuse a shape it already finished — [`finish`] is the
+    /// expensive half of setup (the wiring permutation, the registry
+    /// digest over every table's matrices). The one thing NOT hashed is a
+    /// table's matrices: a reuse trusts that within a process a gate type
+    /// with the same metadata builds the same table, which holds for every
+    /// gate type that derives its table from its parameters.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+        struct Sink {
+            h: blake3::Hasher,
+            buf: Vec<u8>,
+        }
+        impl Sink {
+            fn u(&mut self, x: usize) {
+                self.buf.extend_from_slice(&(x as u64).to_le_bytes());
+                if self.buf.len() >= 1 << 16 {
+                    self.h.update(&self.buf);
+                    self.buf.clear();
+                }
+            }
+        }
+        let mut k = Sink {
+            h: blake3::Hasher::new(),
+            buf: Vec::with_capacity((1 << 16) + 64),
+        };
+        k.h.update(b"flock-shape-fingerprint-v0");
+        k.u(self.nu);
+        k.u(self.slots.len());
+        let tid = BuildHasherDefault::<DefaultHasher>::default();
+        for (slot, ty) in self.slots.iter().zip(&self.slot_types) {
+            k.u(tid.hash_one(ty) as usize);
+            let t = slot.table_ref();
+            k.u(t.k_log);
+            k.u(t.useful_bits);
+            k.u(usize::from(t.is_element()));
+            k.u(t.const_pin.unwrap_or(usize::MAX));
+            k.u(t.io_schema.len());
+            for w in &t.io_schema {
+                k.u(w.word_col);
+                k.u(usize::from(w.dir == IoDirection::In));
+            }
+            k.u(slot.n_in());
+            k.u(slot.n_out());
+        }
+        k.u(self.wires.len());
+        for (i, cells) in self.wires.iter().enumerate() {
+            // The class root, without the path compression `find` does.
+            let mut r = i;
+            while self.parent[r] != r {
+                r = self.parent[r];
+            }
+            k.u(r);
+            k.u(cells.len());
+            for c in cells {
+                k.u(c.slot);
+                k.u(c.row);
+            }
+        }
+        k.u(self.public.len());
+        for (w, f) in self.public.iter().zip(&self.fixed_public) {
+            k.u(w.0);
+            match f {
+                None => k.u(0),
+                Some(v) => {
+                    k.u(1);
+                    k.u(v.lo as usize);
+                    k.u(v.hi as usize);
+                }
+            }
+        }
+        k.u(self.inputs.len());
+        for w in &self.inputs {
+            k.u(w.0);
+        }
+        k.u(self.steps.len());
+        for st in &self.steps {
+            k.u(st.slot);
+            k.u(usize::from(st.hinted));
+            k.u(st.inputs.len());
+            for &w in &st.inputs {
+                k.u(w);
+            }
+            k.u(st.outputs.len());
+            for &w in &st.outputs {
+                k.u(w);
+            }
+        }
+        for &n in &self.rows_per_slot {
+            k.u(n);
+        }
+        k.u(self.n_hints);
+        k.u(self.islands.len());
+        for &(a, b) in &self.islands {
+            k.u(a);
+            k.u(b);
+        }
+        let Sink { mut h, buf } = k;
+        h.update(&buf);
+        *h.finalize().as_bytes()
     }
 
     pub fn finish(mut self) -> Result<CircuitShape, CircuitError> {
@@ -1483,6 +1603,20 @@ pub struct CircuitWitness {
 }
 
 impl CircuitWitness {
+    /// A witness carrying ONLY the public segment — no slot witnesses, no
+    /// rows. This is what a VERIFIER of a circuit proof legitimately holds:
+    /// the proof's statement without the prover's private trace. Anything
+    /// that reads only `public` (a recursion parent replaying a child's
+    /// verification) can consume it; [`Self::rows`] on it panics.
+    pub fn public_only(public: Vec<F128>) -> Self {
+        Self {
+            public,
+            witnesses: Vec::new(),
+            rows: Vec::new(),
+            slot_types: Vec::new(),
+        }
+    }
+
     /// A slot's rows in instantiation order, with their concrete type
     /// recovered.
     ///

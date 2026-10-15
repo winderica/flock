@@ -8,6 +8,7 @@ members = [
     "crates/flock-multilinear",
     "crates/flock-parallel",
     "crates/flock-prover",
+    "crates/flock-tornado",
     "crates/flock-transcript",
 ]
 resolver = "2"
